@@ -1,0 +1,49 @@
+name: Security Issue
+description: Report a security concern affecting the workstation or repository.
+title: "[Security]: "
+labels:
+  - type:security
+
+body:
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - Prompt Injection
+        - Tool Boundary
+        - Authentication / Authorization
+        - Secrets
+        - Dependency
+        - Code Execution
+        - Data Exposure
+        - CI/CD
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Potential Impact
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction / Evidence
+
+  - type: textarea
+    id: mitigation
+    attributes:
+      label: Suggested Mitigation
+    validations:
+      required: false

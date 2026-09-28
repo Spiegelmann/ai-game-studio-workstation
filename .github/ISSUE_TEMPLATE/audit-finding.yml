@@ -1,0 +1,62 @@
+name: Audit Finding
+description: Record a finding discovered during an architecture, security, tooling, or readiness audit.
+title: "[Audit]: "
+labels:
+  - type:audit
+
+body:
+  - type: dropdown
+    id: domain
+    attributes:
+      label: Audit Domain
+      options:
+        - Architecture
+        - Security
+        - Prompt Injection
+        - Tool Boundary
+        - State & Recovery
+        - Economics & Scaling
+        - Implementation Readiness
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Critical
+        - High
+        - Medium
+        - Low
+        - Informational
+    validations:
+      required: true
+
+  - type: textarea
+    id: finding
+    attributes:
+      label: Finding
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact / Risk
+    validations:
+      required: true
+
+  - type: textarea
+    id: recommendation
+    attributes:
+      label: Recommended Resolution
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Resolution Criteria
+      description: What must be true before this finding can be considered resolved?

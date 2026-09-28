@@ -1,0 +1,49 @@
+name: Agent Task
+description: Define a task intended to be executed or assisted by an AI agent.
+title: "[Agent]: "
+labels:
+  - type:agent-task
+
+body:
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: What should the agent accomplish?
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is the agent allowed to modify or investigate?
+    validations:
+      required: true
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints
+      description: What must the agent not modify, execute, or change?
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: What tests or checks must pass?
+
+  - type: textarea
+    id: human_review
+    attributes:
+      label: Human Review Requirements
+      description: What requires explicit human approval?

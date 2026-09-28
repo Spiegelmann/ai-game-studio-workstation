@@ -1,0 +1,37 @@
+name: Architecture Decision
+description: Record an architectural decision or design choice.
+title: "[ADR]: "
+labels:
+  - type:architecture
+
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What problem or architectural situation are we addressing?
+    validations:
+      required: true
+
+  - type: textarea
+    id: decision
+    attributes:
+      label: Decision
+      description: What approach are we proposing?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+    validations:
+      required: true
+
+  - type: textarea
+    id: consequences
+    attributes:
+      label: Consequences
+      description: What are the expected benefits, costs, constraints, or trade-offs?
+    validations:
+      required: true

@@ -1,0 +1,41 @@
+name: Research / Investigation
+description: Investigate an unknown, technical question, technology, or architectural possibility.
+title: "[Research]: "
+labels:
+  - type:research
+
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Research Question
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Why are we investigating this?
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What should and should not be investigated?
+
+  - type: textarea
+    id: findings
+    attributes:
+      label: Findings
+
+  - type: textarea
+    id: conclusion
+    attributes:
+      label: Conclusion
+      description: What did we learn?
+
+  - type: textarea
+    id: recommendation
+    attributes:
+      label: Recommendation

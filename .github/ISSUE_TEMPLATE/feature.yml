@@ -1,0 +1,46 @@
+name: Feature
+description: Propose a new capability or functional change.
+title: "[Feature]: "
+labels:
+  - type:feature
+
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What should be added or changed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this feature needed?
+    validations:
+      required: true
+
+  - type: textarea
+    id: requirements
+    attributes:
+      label: Requirements
+      description: What must the implementation accomplish?
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: How do we determine that the feature is complete?
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_considerations
+    attributes:
+      label: Additional Considerations
+      description: Dependencies, risks, architectural concerns, or relevant context.
+    validations:
+      required: false
