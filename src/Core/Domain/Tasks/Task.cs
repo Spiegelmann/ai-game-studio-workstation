@@ -8,6 +8,7 @@ public sealed class Task
     private readonly ReadOnlyCollection<AcceptanceCriterion> _acceptanceCriteria;
     private readonly ReadOnlyCollection<StopCondition> _stopConditions;
     private readonly TaskTransitionOperation[] _appliedOperations;
+    private readonly ReadOnlyCollection<TaskTransitionOperation> _appliedOperationsView;
 
     public Task(
         TaskId id,
@@ -45,6 +46,7 @@ public sealed class Task
         UpdatedAt = createdAt;
         Revision = revision;
         _appliedOperations = [];
+        _appliedOperationsView = Array.AsReadOnly(_appliedOperations);
     }
 
     private Task(
@@ -67,6 +69,7 @@ public sealed class Task
         UpdatedAt = updatedAt;
         Revision = revision;
         _appliedOperations = appliedOperations;
+        _appliedOperationsView = Array.AsReadOnly(_appliedOperations);
     }
 
     public TaskId Id { get; }
@@ -92,6 +95,8 @@ public sealed class Task
     public DateTimeOffset UpdatedAt { get; }
 
     public TaskRevision Revision { get; }
+
+    public IReadOnlyList<TaskTransitionOperation> AppliedOperations => _appliedOperationsView;
 
     public TaskOperationResult ApplyTransition(
         TaskTransitionOperation operation,

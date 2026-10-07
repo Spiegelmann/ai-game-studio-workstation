@@ -10,5 +10,8 @@ public sealed class ArchitectureDependencyTests
         ArchitectureAssertions.AssertProjectReferences(
             Path.Combine("src", "Application", "AiGameStudioWorkstation.Application.csproj"),
             "AiGameStudioWorkstation.Core");
+        ArchitectureAssertions.AssertNoPackageReference(
+            Path.Combine("src", "Application", "AiGameStudioWorkstation.Application.csproj"),
+            "Microsoft.Data.Sqlite");
     }
 }

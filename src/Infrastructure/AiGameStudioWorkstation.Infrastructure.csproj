@@ -1,6 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.0" />
     <ProjectReference Include="..\Application\AiGameStudioWorkstation.Application.csproj" />
     <ProjectReference Include="..\Core\AiGameStudioWorkstation.Core.csproj" />
   </ItemGroup>

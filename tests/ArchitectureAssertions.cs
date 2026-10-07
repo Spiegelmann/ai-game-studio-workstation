@@ -22,6 +22,21 @@ internal static class ArchitectureAssertions
             actualReferences);
     }
 
+    public static void AssertNoPackageReference(string projectRelativePath, string packageName)
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var projectPath = Path.Combine(repositoryRoot, projectRelativePath);
+        var packageReferences = XDocument.Load(projectPath)
+            .Descendants("PackageReference")
+            .Select(reference => (string?)reference.Attribute("Include"))
+            .ToArray();
+
+        Assert.DoesNotContain(packageReferences, package => string.Equals(
+            package,
+            packageName,
+            StringComparison.OrdinalIgnoreCase));
+    }
+
     private static string FindRepositoryRoot()
     {
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
