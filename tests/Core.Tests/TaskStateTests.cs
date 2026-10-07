@@ -27,7 +27,6 @@ public sealed class TaskStateTests
 
     [Theory]
     [InlineData(TaskState.Accepted)]
-    [InlineData(TaskState.Failed)]
     [InlineData(TaskState.Cancelled)]
     public void Identifies_terminal_states(TaskState state)
     {
@@ -40,6 +39,7 @@ public sealed class TaskStateTests
     [InlineData(TaskState.Claimed)]
     [InlineData(TaskState.InProgress)]
     [InlineData(TaskState.Verification)]
+    [InlineData(TaskState.Failed)]
     [InlineData(TaskState.Blocked)]
     [InlineData(TaskState.Recovering)]
     [InlineData(TaskState.HumanReviewRequired)]

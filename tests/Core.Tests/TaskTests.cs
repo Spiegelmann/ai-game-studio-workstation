@@ -91,6 +91,67 @@ public sealed class TaskTests
     }
 
     [Fact]
+    public void Transition_matrix_is_enforced_by_the_task_without_mutating_rejected_tasks()
+    {
+        var updatedAt = CreatedAt.AddMinutes(5);
+
+        foreach (var from in Enum.GetValues<TaskState>())
+        {
+            foreach (var to in Enum.GetValues<TaskState>())
+            {
+                var task = CreateTask(state: from, revision: new TaskRevision(4));
+                var isValid = TaskStateTransitions.IsValidTransition(from, to);
+
+                if (isValid)
+                {
+                    var transitioned = task.TransitionTo(to, updatedAt);
+
+                    Assert.NotSame(task, transitioned);
+                    Assert.Equal(to, transitioned.State);
+                    Assert.Equal(updatedAt, transitioned.UpdatedAt);
+                    Assert.Equal(task.Revision, transitioned.Revision);
+                    Assert.Equal(from, task.State);
+                    Assert.Equal(CreatedAt, task.UpdatedAt);
+                }
+                else
+                {
+                    Assert.Throws<InvalidTaskStateTransitionException>(
+                        () => task.TransitionTo(to, updatedAt));
+                    Assert.Equal(from, task.State);
+                    Assert.Equal(CreatedAt, task.UpdatedAt);
+                    Assert.Equal(new TaskRevision(4), task.Revision);
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void Task_can_follow_the_complete_acceptance_path()
+    {
+        var task = CreateTask()
+            .TransitionTo(TaskState.Ready, CreatedAt.AddMinutes(1))
+            .TransitionTo(TaskState.Claimed, CreatedAt.AddMinutes(2))
+            .TransitionTo(TaskState.InProgress, CreatedAt.AddMinutes(3))
+            .TransitionTo(TaskState.Verification, CreatedAt.AddMinutes(4))
+            .TransitionTo(TaskState.Accepted, CreatedAt.AddMinutes(5));
+
+        Assert.Equal(TaskState.Accepted, task.State);
+    }
+
+    [Theory]
+    [InlineData(TaskState.Proposed)]
+    [InlineData(TaskState.Ready)]
+    [InlineData(TaskState.Claimed)]
+    [InlineData(TaskState.InProgress)]
+    public void Cannot_accept_without_entering_verification(TaskState state)
+    {
+        var task = CreateTask(state: state);
+
+        Assert.Throws<InvalidTaskStateTransitionException>(
+            () => task.TransitionTo(TaskState.Accepted, CreatedAt.AddMinutes(1)));
+    }
+
+    [Fact]
     public void Rejects_invalid_transitions_from_a_task()
     {
         var task = CreateTask(state: TaskState.Accepted);
