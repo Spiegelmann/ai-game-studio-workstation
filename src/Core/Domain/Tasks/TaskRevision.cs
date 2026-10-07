@@ -13,4 +13,6 @@ public readonly record struct TaskRevision
     }
 
     public int Value { get; }
+
+    public TaskRevision Next() => new(checked(Value + 1));
 }

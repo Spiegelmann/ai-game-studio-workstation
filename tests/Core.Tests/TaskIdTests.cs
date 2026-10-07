@@ -25,7 +25,12 @@ public sealed class TaskIdTests
     [Fact]
     public void Identifiers_have_value_equality()
     {
-        Assert.Equal(new TaskId("task-1"), new TaskId("task-1"));
+        var first = new TaskId("task-1");
+        var second = new TaskId("task-1");
+
+        Assert.Equal(first, second);
+        Assert.Equal(first.GetHashCode(), second.GetHashCode());
         Assert.NotEqual(new TaskId("task-1"), new TaskId("task-2"));
+        Assert.False(typeof(TaskId).GetProperty(nameof(TaskId.Value))!.CanWrite);
     }
 }

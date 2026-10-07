@@ -55,6 +55,14 @@ public sealed class TaskTests
             new TaskRevision(0)));
     }
 
+    [Fact]
+    public void Task_identity_state_and_revision_cannot_be_mutated_externally()
+    {
+        Assert.False(typeof(DomainTask).GetProperty(nameof(DomainTask.Id))!.CanWrite);
+        Assert.False(typeof(DomainTask).GetProperty(nameof(DomainTask.State))!.CanWrite);
+        Assert.False(typeof(DomainTask).GetProperty(nameof(DomainTask.Revision))!.CanWrite);
+    }
+
     [Theory]
     [InlineData("")]
     [InlineData(" ")]
@@ -81,13 +89,19 @@ public sealed class TaskTests
         var original = CreateTask();
         var updatedAt = CreatedAt.AddMinutes(5);
 
-        var transitioned = original.TransitionTo(TaskState.Ready, updatedAt);
+        var result = original.ApplyTransition(
+            CreateOperation(original, "operation-ready", TaskState.Ready),
+            updatedAt);
+        var transitioned = result.Task;
 
+        Assert.Equal(TaskOperationStatus.Applied, result.Status);
         Assert.Equal(TaskState.Proposed, original.State);
         Assert.Equal(TaskState.Ready, transitioned.State);
+        Assert.Equal(original.Id, transitioned.Id);
         Assert.Equal(CreatedAt, transitioned.CreatedAt);
         Assert.Equal(updatedAt, transitioned.UpdatedAt);
-        Assert.Equal(original.Revision, transitioned.Revision);
+        Assert.Equal(new TaskRevision(1), transitioned.Revision);
+        Assert.Equal(new TaskRevision(0), original.Revision);
     }
 
     [Fact]
@@ -101,22 +115,27 @@ public sealed class TaskTests
             {
                 var task = CreateTask(state: from, revision: new TaskRevision(4));
                 var isValid = TaskStateTransitions.IsValidTransition(from, to);
+                var operation = CreateOperation(task, $"matrix-{from}-{to}", to);
+                var result = task.ApplyTransition(operation, updatedAt);
 
                 if (isValid)
                 {
-                    var transitioned = task.TransitionTo(to, updatedAt);
+                    var transitioned = result.Task;
 
+                    Assert.Equal(TaskOperationStatus.Applied, result.Status);
                     Assert.NotSame(task, transitioned);
                     Assert.Equal(to, transitioned.State);
+                    Assert.Equal(task.Id, transitioned.Id);
                     Assert.Equal(updatedAt, transitioned.UpdatedAt);
-                    Assert.Equal(task.Revision, transitioned.Revision);
+                    Assert.Equal(new TaskRevision(5), transitioned.Revision);
                     Assert.Equal(from, task.State);
                     Assert.Equal(CreatedAt, task.UpdatedAt);
                 }
                 else
                 {
-                    Assert.Throws<InvalidTaskStateTransitionException>(
-                        () => task.TransitionTo(to, updatedAt));
+                    Assert.Equal(TaskOperationStatus.Rejected, result.Status);
+                    Assert.Equal(TaskOperationRejection.InvalidTransition, result.Rejection);
+                    Assert.Same(task, result.Task);
                     Assert.Equal(from, task.State);
                     Assert.Equal(CreatedAt, task.UpdatedAt);
                     Assert.Equal(new TaskRevision(4), task.Revision);
@@ -128,14 +147,17 @@ public sealed class TaskTests
     [Fact]
     public void Task_can_follow_the_complete_acceptance_path()
     {
-        var task = CreateTask()
-            .TransitionTo(TaskState.Ready, CreatedAt.AddMinutes(1))
-            .TransitionTo(TaskState.Claimed, CreatedAt.AddMinutes(2))
-            .TransitionTo(TaskState.InProgress, CreatedAt.AddMinutes(3))
-            .TransitionTo(TaskState.Verification, CreatedAt.AddMinutes(4))
-            .TransitionTo(TaskState.Accepted, CreatedAt.AddMinutes(5));
+        var task = CreateTask();
+        var taskId = task.Id;
+        task = Apply(task, TaskState.Ready, "acceptance-ready", CreatedAt.AddMinutes(1));
+        task = Apply(task, TaskState.Claimed, "acceptance-claimed", CreatedAt.AddMinutes(2));
+        task = Apply(task, TaskState.InProgress, "acceptance-progress", CreatedAt.AddMinutes(3));
+        task = Apply(task, TaskState.Verification, "acceptance-verification", CreatedAt.AddMinutes(4));
+        task = Apply(task, TaskState.Accepted, "acceptance-accepted", CreatedAt.AddMinutes(5));
 
         Assert.Equal(TaskState.Accepted, task.State);
+        Assert.Equal(taskId, task.Id);
+        Assert.Equal(new TaskRevision(5), task.Revision);
     }
 
     [Theory]
@@ -147,8 +169,13 @@ public sealed class TaskTests
     {
         var task = CreateTask(state: state);
 
-        Assert.Throws<InvalidTaskStateTransitionException>(
-            () => task.TransitionTo(TaskState.Accepted, CreatedAt.AddMinutes(1)));
+        var result = task.ApplyTransition(
+            CreateOperation(task, "accept-without-verification", TaskState.Accepted),
+            CreatedAt.AddMinutes(1));
+
+        Assert.Equal(TaskOperationStatus.Rejected, result.Status);
+        Assert.Equal(TaskOperationRejection.InvalidTransition, result.Rejection);
+        Assert.Same(task, result.Task);
     }
 
     [Fact]
@@ -156,8 +183,13 @@ public sealed class TaskTests
     {
         var task = CreateTask(state: TaskState.Accepted);
 
-        Assert.Throws<InvalidTaskStateTransitionException>(
-            () => task.TransitionTo(TaskState.InProgress, CreatedAt.AddMinutes(1)));
+        var result = task.ApplyTransition(
+            CreateOperation(task, "reopen-accepted", TaskState.InProgress),
+            CreatedAt.AddMinutes(1));
+
+        Assert.Equal(TaskOperationStatus.Rejected, result.Status);
+        Assert.Equal(TaskOperationRejection.InvalidTransition, result.Rejection);
+        Assert.Same(task, result.Task);
     }
 
     [Fact]
@@ -226,4 +258,21 @@ public sealed class TaskTests
             state,
             CreatedAt,
             revision ?? new TaskRevision(0));
+
+    private static TaskTransitionOperation CreateOperation(
+        DomainTask task,
+        string operationId,
+        TaskState targetState) =>
+        new(task.Id, new OperationId(operationId), task.Revision, targetState);
+
+    private static DomainTask Apply(
+        DomainTask task,
+        TaskState targetState,
+        string operationId,
+        DateTimeOffset updatedAt)
+    {
+        var result = task.ApplyTransition(CreateOperation(task, operationId, targetState), updatedAt);
+        Assert.Equal(TaskOperationStatus.Applied, result.Status);
+        return result.Task;
+    }
 }

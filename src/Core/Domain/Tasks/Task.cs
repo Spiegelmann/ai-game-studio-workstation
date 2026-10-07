@@ -7,6 +7,7 @@ public sealed class Task
     private readonly ReadOnlyCollection<TaskId> _dependencies;
     private readonly ReadOnlyCollection<AcceptanceCriterion> _acceptanceCriteria;
     private readonly ReadOnlyCollection<StopCondition> _stopConditions;
+    private readonly TaskTransitionOperation[] _appliedOperations;
 
     public Task(
         TaskId id,
@@ -43,9 +44,15 @@ public sealed class Task
         CreatedAt = createdAt;
         UpdatedAt = createdAt;
         Revision = revision;
+        _appliedOperations = [];
     }
 
-    private Task(Task source, TaskState state, DateTimeOffset updatedAt)
+    private Task(
+        Task source,
+        TaskState state,
+        DateTimeOffset updatedAt,
+        TaskRevision revision,
+        TaskTransitionOperation[] appliedOperations)
     {
         Id = source.Id;
         Intent = source.Intent;
@@ -58,7 +65,8 @@ public sealed class Task
         State = state;
         CreatedAt = source.CreatedAt;
         UpdatedAt = updatedAt;
-        Revision = source.Revision;
+        Revision = revision;
+        _appliedOperations = appliedOperations;
     }
 
     public TaskId Id { get; }
@@ -85,14 +93,57 @@ public sealed class Task
 
     public TaskRevision Revision { get; }
 
-    public Task TransitionTo(TaskState newState, DateTimeOffset updatedAt)
+    public TaskOperationResult ApplyTransition(
+        TaskTransitionOperation operation,
+        DateTimeOffset updatedAt)
     {
-        if (!TaskStateTransitions.IsValidTransition(State, newState))
+        ArgumentNullException.ThrowIfNull(operation);
+
+        if (operation.TaskId != Id)
         {
-            throw new InvalidTaskStateTransitionException(State, newState);
+            return TaskOperationResult.Rejected(this, TaskOperationRejection.TaskMismatch);
         }
 
-        return new Task(this, newState, updatedAt);
+        var previouslyApplied = _appliedOperations.FirstOrDefault(
+            applied => applied.OperationId == operation.OperationId);
+        if (previouslyApplied is not null)
+        {
+            return previouslyApplied == operation
+                ? TaskOperationResult.AlreadyApplied(this)
+                : TaskOperationResult.Rejected(this, TaskOperationRejection.OperationIdConflict);
+        }
+
+        if (operation.ExpectedRevision != Revision)
+        {
+            return TaskOperationResult.Rejected(this, TaskOperationRejection.StaleRevision);
+        }
+
+        if (!TaskStateTransitions.IsValidTransition(State, operation.TargetState))
+        {
+            return TaskOperationResult.Rejected(this, TaskOperationRejection.InvalidTransition);
+        }
+
+        TaskRevision nextRevision;
+        try
+        {
+            nextRevision = Revision.Next();
+        }
+        catch (OverflowException)
+        {
+            return TaskOperationResult.Rejected(this, TaskOperationRejection.RevisionExhausted);
+        }
+
+        var appliedOperations = new TaskTransitionOperation[_appliedOperations.Length + 1];
+        Array.Copy(_appliedOperations, appliedOperations, _appliedOperations.Length);
+        appliedOperations[^1] = operation;
+
+        var updatedTask = new Task(
+            this,
+            operation.TargetState,
+            updatedAt,
+            nextRevision,
+            appliedOperations);
+        return TaskOperationResult.Applied(updatedTask);
     }
 
     private static ReadOnlyCollection<T> CopyCollection<T>(IEnumerable<T> values, string parameterName)
