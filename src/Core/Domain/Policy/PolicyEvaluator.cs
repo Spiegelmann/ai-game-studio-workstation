@@ -44,27 +44,51 @@ public sealed class PolicyEvaluator : IPolicyEvaluator
                 "Policy evaluation cannot continue because the action is unsupported.");
         }
 
-        var registration = context.Registrations.FirstOrDefault(
-            candidate => candidate.Capability == requiredCapability);
-        if (registration is null)
+        var registrations = context.Registrations
+            .Where(candidate => candidate.Capability == requiredCapability)
+            .ToArray();
+        if (registrations.Length == 0)
         {
             return Escalate(
                 "capability.missing",
                 "Policy evaluation cannot establish permission because the required capability is not present.");
         }
 
-        if (registration.Provenance.Trust != PolicyCapabilityTrust.Trusted)
+        var matches = registrations
+            .Select(registration => (Registration: registration, Match: registration.Scope.CompareTo(action.Scope)))
+            .ToArray();
+
+        if (matches.Any(candidate =>
+                candidate.Match == PolicyScopeMatch.Match &&
+                candidate.Registration.Provenance.Trust == PolicyCapabilityTrust.Trusted))
+        {
+            return PolicyDecision.Allow(new PolicyReason(
+                "capability.granted",
+                "A trusted registration for the required capability includes the requested scope."));
+        }
+
+        if (matches.All(candidate => candidate.Match == PolicyScopeMatch.NoMatch))
+        {
+            return PolicyDecision.Deny(new PolicyReason(
+                "capability.scope.denied",
+                "The requested scope is outside every registered boundary for the required capability."));
+        }
+
+        var untrustedPotentialMatch = matches.FirstOrDefault(candidate =>
+            candidate.Match != PolicyScopeMatch.NoMatch &&
+            candidate.Registration.Provenance.Trust != PolicyCapabilityTrust.Trusted);
+        if (untrustedPotentialMatch.Registration is not null)
         {
             return Escalate(
-                registration.Provenance.Trust == PolicyCapabilityTrust.Unknown
+                untrustedPotentialMatch.Registration.Provenance.Trust == PolicyCapabilityTrust.Unknown
                     ? "capability.provenance.unknown"
                     : "capability.provenance.untrusted",
                 "Policy evaluation cannot establish permission because the required capability provenance is not trusted.");
         }
 
-        return PolicyDecision.Allow(new PolicyReason(
-            "capability.granted",
-            "The context contains a trusted registration for the capability required for this action."));
+        return Escalate(
+            "capability.scope.unknown",
+            "Policy evaluation cannot establish whether the requested scope is within the registered boundary.");
     }
 
     private static PolicyCapability? GetRequiredCapability(PolicyAction action)

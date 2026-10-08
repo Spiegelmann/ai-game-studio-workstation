@@ -71,6 +71,8 @@ public sealed record PolicyContext
             .OrderBy(registration => registration.Capability.Value, StringComparer.Ordinal)
             .ThenBy(registration => registration.Provenance.Source)
             .ThenBy(registration => registration.Provenance.Trust)
+            .ThenBy(registration => registration.Scope.Kind)
+            .ThenBy(registration => registration.Scope.BoundaryId?.Value, StringComparer.Ordinal)
             .Distinct()
             .ToArray());
         Capabilities = Array.AsReadOnly(Registrations
