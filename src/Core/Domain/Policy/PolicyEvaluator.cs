@@ -7,22 +7,78 @@ public sealed class PolicyEvaluator : IPolicyEvaluator
         ArgumentNullException.ThrowIfNull(action);
         ArgumentNullException.ThrowIfNull(context);
 
-        return context.Status switch
+        var decision = EvaluateCapabilities(action, context);
+
+        foreach (var rule in context.Rules)
         {
-            PolicyContextStatus.Incomplete => Escalate(
-                "context.incomplete",
-                "Policy evaluation cannot continue because the context is incomplete."),
-            PolicyContextStatus.Unknown => Escalate(
-                "context.unknown",
-                "Policy evaluation cannot continue because the context is unknown."),
-            PolicyContextStatus.Complete => Escalate(
-                "policy.no-applicable-rule",
-                "No policy rule is defined for the proposed action."),
-            _ => Escalate(
-                "context.unknown",
-                "Policy evaluation cannot continue because the context status is unsupported.")
-        };
+            if (rule.AppliesTo(action) && IsMoreRestrictive(rule.Decision, decision))
+            {
+                decision = rule.Decision;
+            }
+        }
+
+        return decision;
     }
+
+    private static PolicyDecision EvaluateCapabilities(PolicyAction action, PolicyContext context)
+    {
+        if (context.Status == PolicyContextStatus.Incomplete)
+        {
+            return Escalate(
+                "context.incomplete",
+                "Policy evaluation cannot continue because the context is incomplete.");
+        }
+
+        if (context.Status == PolicyContextStatus.Unknown)
+        {
+            return Escalate(
+                "context.unknown",
+                "Policy evaluation cannot continue because the context is unknown.");
+        }
+
+        var requiredCapability = GetRequiredCapability(action);
+        if (requiredCapability is null)
+        {
+            return Escalate(
+                "action.unknown",
+                "Policy evaluation cannot continue because the action is unsupported.");
+        }
+
+        if (!context.Capabilities.Contains(requiredCapability))
+        {
+            return Escalate(
+                "capability.missing",
+                "Policy evaluation cannot establish permission because the required capability is not present.");
+        }
+
+        return PolicyDecision.Allow(new PolicyReason(
+            "capability.granted",
+            "The context contains the capability required for this action."));
+    }
+
+    private static PolicyCapability? GetRequiredCapability(PolicyAction action)
+    {
+        var value = action.Category.ToUpperInvariant() switch
+        {
+            "READ" => "workspace.read",
+            "WRITE" => "workspace.write",
+            "EXECUTE" => "process.execute",
+            _ => null
+        };
+
+        return value is null ? null : new PolicyCapability(value);
+    }
+
+    private static bool IsMoreRestrictive(PolicyDecision candidate, PolicyDecision current) =>
+        GetRestriction(candidate.Outcome) > GetRestriction(current.Outcome);
+
+    private static int GetRestriction(PolicyDecisionOutcome outcome) => outcome switch
+    {
+        PolicyDecisionOutcome.Allow => 0,
+        PolicyDecisionOutcome.Escalate => 1,
+        PolicyDecisionOutcome.Deny => 2,
+        _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, "The policy decision outcome is not defined.")
+    };
 
     private static PolicyDecision Escalate(string code, string explanation) =>
         PolicyDecision.Escalate(new PolicyReason(code, explanation));
