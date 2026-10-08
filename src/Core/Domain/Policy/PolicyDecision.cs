@@ -10,6 +10,14 @@ public enum PolicyDecisionOutcome
 public sealed record PolicyDecision
 {
     public PolicyDecision(PolicyDecisionOutcome outcome, PolicyReason reason)
+        : this(outcome, reason, null)
+    {
+    }
+
+    internal PolicyDecision(
+        PolicyDecisionOutcome outcome,
+        PolicyReason reason,
+        PolicyEvaluationTrace? trace)
     {
         if (!Enum.IsDefined(typeof(PolicyDecisionOutcome), outcome))
         {
@@ -17,14 +25,22 @@ public sealed record PolicyDecision
         }
 
         ArgumentNullException.ThrowIfNull(reason);
+        if (trace is not null &&
+            (trace.FinalOutcome != outcome || trace.FinalReason != reason))
+        {
+            throw new ArgumentException("The policy evaluation trace must describe this decision.", nameof(trace));
+        }
 
         Outcome = outcome;
         Reason = reason;
+        Trace = trace;
     }
 
     public PolicyDecisionOutcome Outcome { get; }
 
     public PolicyReason Reason { get; }
+
+    public PolicyEvaluationTrace? Trace { get; }
 
     public static PolicyDecision Allow(PolicyReason reason) =>
         new(PolicyDecisionOutcome.Allow, reason);
