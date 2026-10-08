@@ -34,4 +34,17 @@ public interface ITaskRepository
     System.Threading.Tasks.Task<IReadOnlyList<TaskStateTransitionRecord>> GetStateTransitionsAsync(
         TaskId taskId,
         CancellationToken cancellationToken = default);
+
+    System.Threading.Tasks.Task AddEvidenceAsync(
+        EvidenceRecord evidence,
+        CancellationToken cancellationToken = default);
+
+    System.Threading.Tasks.Task<IReadOnlyList<EvidenceRecord>> GetEvidenceAsync(
+        TaskId taskId,
+        CancellationToken cancellationToken = default);
+
+    System.Threading.Tasks.Task<IReadOnlyList<EvidenceRecord>> GetEvidenceForAttemptAsync(
+        TaskId taskId,
+        AttemptId attemptId,
+        CancellationToken cancellationToken = default);
 }

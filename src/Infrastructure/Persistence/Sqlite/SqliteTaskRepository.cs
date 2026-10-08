@@ -13,7 +13,8 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
 {
     private const int InitialSchemaVersion = 1;
     private const int SchemaVersionTwo = 2;
-    private const int SchemaVersion = 3;
+    private const int SchemaVersionThree = 3;
+    private const int SchemaVersion = 4;
     private const string SchemaVersionTable = "PersistenceSchemaVersion";
     private const int MaximumTaskStateValue = (int)TaskState.HumanReviewRequired;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -21,7 +22,8 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
     [
         new(0, 1, MigrateVersionZeroToOneAsync),
         new(1, 2, ApplySchemaVersionTwoAsync),
-        new(2, 3, ApplySchemaVersionThreeAsync)
+        new(2, 3, ApplySchemaVersionThreeAsync),
+        new(3, 4, ApplySchemaVersionFourAsync)
     ];
     private readonly string _connectionString;
     private readonly string _databasePath;
@@ -481,6 +483,155 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
         }
     }
 
+    public async AsyncTask AddEvidenceAsync(
+        EvidenceRecord evidence,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureReady();
+        ArgumentNullException.ThrowIfNull(evidence);
+
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            using var transaction = connection.BeginTransaction(deferred: false);
+
+            await using (var taskCommand = connection.CreateCommand())
+            {
+                taskCommand.Transaction = transaction;
+                taskCommand.CommandText = "SELECT 1 FROM Tasks WHERE TaskId = $taskId;";
+                taskCommand.Parameters.AddWithValue("$taskId", evidence.TaskId.Value);
+                if (await taskCommand.ExecuteScalarAsync(cancellationToken) is null)
+                {
+                    throw new TaskNotFoundException(evidence.TaskId.Value);
+                }
+            }
+
+            if (evidence.AttemptId is not null)
+            {
+                await using var attemptCommand = connection.CreateCommand();
+                attemptCommand.Transaction = transaction;
+                attemptCommand.CommandText = """
+                    SELECT 1
+                    FROM TaskAttempts
+                    WHERE TaskId = $taskId AND AttemptId = $attemptId;
+                    """;
+                attemptCommand.Parameters.AddWithValue("$taskId", evidence.TaskId.Value);
+                attemptCommand.Parameters.AddWithValue("$attemptId", evidence.AttemptId.Value);
+                if (await attemptCommand.ExecuteScalarAsync(cancellationToken) is null)
+                {
+                    throw new TaskPersistenceException(
+                        $"Attempt '{evidence.AttemptId.Value}' does not exist for task '{evidence.TaskId.Value}'.");
+                }
+            }
+
+            var existing = await LoadEvidenceByIdAsync(
+                connection,
+                transaction,
+                evidence.Id,
+                cancellationToken);
+            if (existing is not null)
+            {
+                if (existing != evidence)
+                {
+                    throw new TaskPersistenceException(
+                        $"Evidence identifier '{evidence.Id.Value}' was reused with different evidence data.");
+                }
+
+                await transaction.CommitAsync(cancellationToken);
+                return;
+            }
+
+            await using var insertCommand = connection.CreateCommand();
+            insertCommand.Transaction = transaction;
+            insertCommand.CommandText = """
+                INSERT INTO EvidenceRecords (
+                    EvidenceId, TaskId, AttemptId, Type, Source, Summary, Timestamp, Reference)
+                VALUES (
+                    $evidenceId, $taskId, $attemptId, $type, $source, $summary, $timestamp, $reference);
+                """;
+            insertCommand.Parameters.AddWithValue("$evidenceId", evidence.Id.Value);
+            insertCommand.Parameters.AddWithValue("$taskId", evidence.TaskId.Value);
+            insertCommand.Parameters.AddWithValue(
+                "$attemptId",
+                (object?)(evidence.AttemptId?.Value) ?? DBNull.Value);
+            insertCommand.Parameters.AddWithValue("$type", (int)evidence.Type);
+            insertCommand.Parameters.AddWithValue("$source", (int)evidence.Source);
+            insertCommand.Parameters.AddWithValue("$summary", evidence.Summary);
+            insertCommand.Parameters.AddWithValue("$timestamp", FormatTimestamp(evidence.Timestamp));
+            insertCommand.Parameters.AddWithValue(
+                "$reference",
+                (object?)(evidence.Reference?.Value) ?? DBNull.Value);
+            await insertCommand.ExecuteNonQueryAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch (SqliteException exception)
+        {
+            throw new TaskPersistenceException(
+                $"Failed to append evidence '{evidence.Id.Value}' for task '{evidence.TaskId.Value}'.",
+                exception);
+        }
+    }
+
+    public async System.Threading.Tasks.Task<IReadOnlyList<EvidenceRecord>> GetEvidenceAsync(
+        TaskId taskId,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureReady();
+        ArgumentNullException.ThrowIfNull(taskId);
+
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            using var transaction = connection.BeginTransaction(deferred: true);
+            var evidence = await LoadEvidenceAsync(
+                connection,
+                transaction,
+                taskId,
+                attemptId: null,
+                filterByAttempt: false,
+                cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return evidence;
+        }
+        catch (SqliteException exception)
+        {
+            throw new TaskPersistenceException(
+                $"Failed to load evidence for task '{taskId.Value}'.",
+                exception);
+        }
+    }
+
+    public async System.Threading.Tasks.Task<IReadOnlyList<EvidenceRecord>> GetEvidenceForAttemptAsync(
+        TaskId taskId,
+        AttemptId attemptId,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureReady();
+        ArgumentNullException.ThrowIfNull(taskId);
+        ArgumentNullException.ThrowIfNull(attemptId);
+
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            using var transaction = connection.BeginTransaction(deferred: true);
+            var evidence = await LoadEvidenceAsync(
+                connection,
+                transaction,
+                taskId,
+                attemptId,
+                filterByAttempt: true,
+                cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return evidence;
+        }
+        catch (SqliteException exception)
+        {
+            throw new TaskPersistenceException(
+                $"Failed to load evidence for attempt '{attemptId.Value}' on task '{taskId.Value}'.",
+                exception);
+        }
+    }
+
     public void Dispose()
     {
         _initializationLock.Wait();
@@ -666,6 +817,7 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
             requireVersionMetadata: true,
             cancellationToken);
         await ValidateExecutionHistorySchemaAsync(connection, cancellationToken);
+        await ValidateEvidenceSchemaAsync(connection, cancellationToken);
 
         await using (var integrityCommand = connection.CreateCommand())
         {
@@ -890,6 +1042,57 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
         await ValidateExecutionHistoryTriggersAsync(connection, cancellationToken);
     }
 
+    private static async AsyncTask ValidateEvidenceSchemaAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var columns = await ReadTableColumnsAsync(
+            connection,
+            transaction: null,
+            "EvidenceRecords",
+            cancellationToken);
+        RequireColumns(
+            "EvidenceRecords",
+            columns,
+            [
+                "EvidenceSequence", "EvidenceId", "TaskId", "AttemptId", "Type", "Source",
+                "Summary", "Timestamp", "Reference"
+            ]);
+        if (!columns.Any(column =>
+                string.Equals(column.Name, "EvidenceSequence", StringComparison.OrdinalIgnoreCase)
+                && column.PrimaryKeyPosition == 1))
+        {
+            throw new TaskPersistenceException(
+                "The EvidenceRecords table is missing its insertion-sequence primary key.");
+        }
+
+        var uniqueIndexes = await ReadUniqueIndexesAsync(
+            connection,
+            transaction: null,
+            "EvidenceRecords",
+            cancellationToken);
+        if (!uniqueIndexes.Any(index => index.Columns.SequenceEqual(
+                ["EvidenceId"],
+                StringComparer.OrdinalIgnoreCase)))
+        {
+            throw new TaskPersistenceException(
+                "The EvidenceRecords table is missing its evidence-identity uniqueness constraint.");
+        }
+
+        await ValidateRequiredForeignKeyAsync(
+            connection,
+            "EvidenceRecords",
+            "Tasks",
+            [("TaskId", "TaskId")],
+            cancellationToken);
+        await ValidateRequiredForeignKeyAsync(
+            connection,
+            "EvidenceRecords",
+            "TaskAttempts",
+            [("TaskId", "TaskId"), ("AttemptId", "AttemptId")],
+            cancellationToken);
+    }
+
     private static async System.Threading.Tasks.Task<IReadOnlyList<TableColumn>> ReadTableColumnsAsync(
         SqliteConnection connection,
         SqliteTransaction? transaction,
@@ -1048,7 +1251,9 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
             ["TaskAttemptSnapshots_NoUpdate"] = "BEFORE UPDATE ON TaskAttemptSnapshots",
             ["TaskAttemptSnapshots_NoDelete"] = "BEFORE DELETE ON TaskAttemptSnapshots",
             ["StateTransitions_NoUpdate"] = "BEFORE UPDATE ON StateTransitions",
-            ["StateTransitions_NoDelete"] = "BEFORE DELETE ON StateTransitions"
+            ["StateTransitions_NoDelete"] = "BEFORE DELETE ON StateTransitions",
+            ["EvidenceRecords_NoUpdate"] = "BEFORE UPDATE ON EvidenceRecords",
+            ["EvidenceRecords_NoDelete"] = "BEFORE DELETE ON EvidenceRecords"
         };
 
         await using var command = connection.CreateCommand();
@@ -1071,7 +1276,7 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
         if (requiredTriggers.Count != 0)
         {
             throw new TaskPersistenceException(
-                "One or more immutable attempt or state-transition history triggers are missing or invalid.");
+                "One or more immutable attempt, state-transition, or evidence history triggers are missing or invalid.");
         }
     }
 
@@ -1333,10 +1538,75 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
             SET Version = $version, AppliedAt = $appliedAt
             WHERE Id = 1 AND Version = $previousVersion;
 
+            PRAGMA user_version = {SchemaVersionThree};
+            """;
+        command.Parameters.AddWithValue("$version", SchemaVersionThree);
+        command.Parameters.AddWithValue("$previousVersion", SchemaVersionTwo);
+        command.Parameters.AddWithValue("$appliedAt", FormatTimestamp(DateTimeOffset.UtcNow));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+
+        await using var verifyCommand = connection.CreateCommand();
+        verifyCommand.Transaction = transaction;
+        verifyCommand.CommandText = $"SELECT Version FROM {SchemaVersionTable} WHERE Id = 1;";
+        var version = Convert.ToInt32(
+            await verifyCommand.ExecuteScalarAsync(cancellationToken),
+            CultureInfo.InvariantCulture);
+        if (version != SchemaVersionThree)
+        {
+            throw new TaskPersistenceException(
+                "The schema-version metadata was not at version 2 when the attempt-history migration ran.");
+        }
+    }
+
+    private static async AsyncTask ApplySchemaVersionFourAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"""
+            CREATE TABLE EvidenceRecords (
+                EvidenceSequence INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                EvidenceId TEXT NOT NULL UNIQUE CHECK (length(trim(EvidenceId)) > 0),
+                TaskId TEXT NOT NULL,
+                AttemptId TEXT NULL CHECK (AttemptId IS NULL OR length(trim(AttemptId)) > 0),
+                Type INTEGER NOT NULL CHECK (Type BETWEEN 0 AND {(int)EvidenceType.System}),
+                Source INTEGER NOT NULL CHECK (Source BETWEEN 0 AND {(int)EvidenceSource.External}),
+                Summary TEXT NOT NULL CHECK (length(trim(Summary)) > 0),
+                Timestamp TEXT NOT NULL,
+                Reference TEXT NULL CHECK (Reference IS NULL OR length(trim(Reference)) > 0),
+                FOREIGN KEY (TaskId) REFERENCES Tasks (TaskId) ON DELETE RESTRICT,
+                FOREIGN KEY (TaskId, AttemptId)
+                    REFERENCES TaskAttempts (TaskId, AttemptId) ON DELETE RESTRICT
+            );
+
+            CREATE INDEX EvidenceRecords_ByTaskSequence
+                ON EvidenceRecords (TaskId, EvidenceSequence);
+
+            CREATE INDEX EvidenceRecords_ByAttemptSequence
+                ON EvidenceRecords (TaskId, AttemptId, EvidenceSequence);
+
+            CREATE TRIGGER EvidenceRecords_NoUpdate
+            BEFORE UPDATE ON EvidenceRecords
+            BEGIN
+                SELECT RAISE(ABORT, 'Evidence history is immutable.');
+            END;
+
+            CREATE TRIGGER EvidenceRecords_NoDelete
+            BEFORE DELETE ON EvidenceRecords
+            BEGIN
+                SELECT RAISE(ABORT, 'Evidence history is immutable.');
+            END;
+
+            UPDATE {SchemaVersionTable}
+            SET Version = $version, AppliedAt = $appliedAt
+            WHERE Id = 1 AND Version = $previousVersion;
+
             PRAGMA user_version = {SchemaVersion};
             """;
         command.Parameters.AddWithValue("$version", SchemaVersion);
-        command.Parameters.AddWithValue("$previousVersion", SchemaVersionTwo);
+        command.Parameters.AddWithValue("$previousVersion", SchemaVersionThree);
         command.Parameters.AddWithValue("$appliedAt", FormatTimestamp(DateTimeOffset.UtcNow));
         await command.ExecuteNonQueryAsync(cancellationToken);
 
@@ -1349,7 +1619,7 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
         if (version != SchemaVersion)
         {
             throw new TaskPersistenceException(
-                "The schema-version metadata was not at version 2 when the attempt-history migration ran.");
+                "The schema-version metadata was not at version 3 when the evidence migration ran.");
         }
     }
 
@@ -1715,6 +1985,90 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
 
     private static string FormatTimestamp(DateTimeOffset timestamp) =>
         timestamp.ToString("O", CultureInfo.InvariantCulture);
+
+    private static async System.Threading.Tasks.Task<EvidenceRecord?> LoadEvidenceByIdAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        EvidenceId evidenceId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT EvidenceId, TaskId, AttemptId, Type, Source, Summary, Timestamp, Reference
+            FROM EvidenceRecords
+            WHERE EvidenceId = $evidenceId;
+            """;
+        command.Parameters.AddWithValue("$evidenceId", evidenceId.Value);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken)
+            ? ReadEvidenceRecord(reader)
+            : null;
+    }
+
+    private static async System.Threading.Tasks.Task<IReadOnlyList<EvidenceRecord>> LoadEvidenceAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        TaskId taskId,
+        AttemptId? attemptId,
+        bool filterByAttempt,
+        CancellationToken cancellationToken)
+    {
+        var evidence = new List<EvidenceRecord>();
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT EvidenceId, TaskId, AttemptId, Type, Source, Summary, Timestamp, Reference
+            FROM EvidenceRecords
+            WHERE TaskId = $taskId
+              AND ($filterByAttempt = 0 OR AttemptId = $attemptId)
+            ORDER BY EvidenceSequence;
+            """;
+        command.Parameters.AddWithValue("$taskId", taskId.Value);
+        command.Parameters.AddWithValue("$filterByAttempt", filterByAttempt ? 1 : 0);
+        command.Parameters.AddWithValue("$attemptId", (object?)(attemptId?.Value) ?? DBNull.Value);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            evidence.Add(ReadEvidenceRecord(reader));
+        }
+
+        return evidence;
+    }
+
+    private static EvidenceRecord ReadEvidenceRecord(SqliteDataReader reader)
+    {
+        try
+        {
+            var evidenceType = reader.GetInt32(3);
+            var evidenceSource = reader.GetInt32(4);
+            if (!Enum.IsDefined(typeof(EvidenceType), evidenceType)
+                || !Enum.IsDefined(typeof(EvidenceSource), evidenceSource))
+            {
+                throw new InvalidDataException("Persisted evidence contains an undefined type or source.");
+            }
+
+            return new EvidenceRecord(
+                new EvidenceId(reader.GetString(0)),
+                new TaskId(reader.GetString(1)),
+                (EvidenceType)evidenceType,
+                (EvidenceSource)evidenceSource,
+                reader.GetString(5),
+                ParseTimestamp(reader.GetString(6), "Timestamp"),
+                reader.IsDBNull(2) ? null : new AttemptId(reader.GetString(2)),
+                reader.IsDBNull(7) ? null : new EvidenceReference(reader.GetString(7)));
+        }
+        catch (Exception exception) when (
+            exception is ArgumentException
+            or InvalidCastException
+            or InvalidDataException
+            or OverflowException)
+        {
+            throw new TaskDataCorruptionException(
+                "Persisted evidence contains invalid domain data.",
+                exception);
+        }
+    }
 
     private static async System.Threading.Tasks.Task<int> AppendAttemptSnapshotAsync(
         SqliteConnection connection,

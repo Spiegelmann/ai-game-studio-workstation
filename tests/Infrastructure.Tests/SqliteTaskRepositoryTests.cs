@@ -178,6 +178,243 @@ public sealed class SqliteTaskRepositoryTests
     }
 
     [Fact]
+    public async System.Threading.Tasks.Task Evidence_is_append_only_ordered_and_survives_repository_restart()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await repository.AddAsync(task);
+        var attempt = new TaskAttempt(
+            new AttemptId("attempt-evidence"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+        await repository.AppendAttemptAsync(attempt);
+
+        var first = CreateEvidence("evidence-first", task.Id);
+        var second = CreateEvidence("evidence-second", task.Id, attempt.Id);
+        var third = CreateEvidence("evidence-third", task.Id);
+        await repository.AddEvidenceAsync(first);
+        await repository.AddEvidenceAsync(second);
+        await repository.AddEvidenceAsync(first);
+        await repository.AddEvidenceAsync(third);
+
+        var restartedRepository = await database.CreateInitializedRepositoryAsync();
+        Assert.Equal([first, second, third], await restartedRepository.GetEvidenceAsync(task.Id));
+        Assert.Equal(
+            [second],
+            await restartedRepository.GetEvidenceForAttemptAsync(task.Id, attempt.Id));
+        Assert.Equal(3, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM EvidenceRecords;"));
+
+        await Assert.ThrowsAsync<SqliteException>(() => database.ExecuteSqlAsync(
+            "UPDATE EvidenceRecords SET Summary = 'rewritten' WHERE EvidenceId = $evidenceId;",
+            ("$evidenceId", first.Id.Value)));
+        await Assert.ThrowsAsync<SqliteException>(() => database.ExecuteSqlAsync(
+            "DELETE FROM EvidenceRecords WHERE EvidenceId = $evidenceId;",
+            ("$evidenceId", first.Id.Value)));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Evidence_rejects_missing_task_or_attempt_and_conflicting_identity_reuse()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        var missingTaskEvidence = CreateEvidence("evidence-missing-task", new TaskId("missing-task"));
+
+        await Assert.ThrowsAsync<TaskNotFoundException>(() => repository.AddEvidenceAsync(missingTaskEvidence));
+        await repository.AddAsync(task);
+
+        var missingAttemptEvidence = CreateEvidence(
+            "evidence-missing-attempt",
+            task.Id,
+            new AttemptId("missing-attempt"));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AddEvidenceAsync(missingAttemptEvidence));
+
+        var otherTask = CreateTask(taskId: new TaskId("task-other"));
+        await repository.AddAsync(otherTask);
+        var otherAttempt = new TaskAttempt(
+            new AttemptId("attempt-other-task"),
+            otherTask.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+        await repository.AppendAttemptAsync(otherAttempt);
+        var crossTaskEvidence = CreateEvidence(
+            "evidence-cross-task-attempt",
+            task.Id,
+            otherAttempt.Id);
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AddEvidenceAsync(crossTaskEvidence));
+
+        var original = CreateEvidence("evidence-identity-conflict", task.Id);
+        await repository.AddEvidenceAsync(original);
+        var conflicting = CreateEvidence(
+            "evidence-identity-conflict",
+            task.Id,
+            summary: "Different evidence.");
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AddEvidenceAsync(conflicting));
+        Assert.Equal([original], await repository.GetEvidenceAsync(task.Id));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Concurrent_evidence_appends_preserve_distinct_records_and_deduplicate_exact_replays()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var initializer = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await initializer.AddAsync(task);
+        var repositoryA = await database.CreateInitializedRepositoryAsync();
+        var repositoryB = await database.CreateInitializedRepositoryAsync();
+        var duplicate = CreateEvidence("evidence-concurrent-duplicate", task.Id);
+        var distinctA = CreateEvidence("evidence-concurrent-a", task.Id, summary: "Same content.");
+        var distinctB = CreateEvidence("evidence-concurrent-b", task.Id, summary: "Same content.");
+
+        await System.Threading.Tasks.Task.WhenAll(
+            repositoryA.AddEvidenceAsync(duplicate),
+            repositoryB.AddEvidenceAsync(duplicate),
+            repositoryA.AddEvidenceAsync(distinctA),
+            repositoryB.AddEvidenceAsync(distinctB));
+
+        var evidence = await (await database.CreateInitializedRepositoryAsync()).GetEvidenceAsync(task.Id);
+        Assert.Equal(3, evidence.Count);
+        Assert.Contains(duplicate, evidence);
+        Assert.Contains(distinctA, evidence);
+        Assert.Contains(distinctB, evidence);
+        Assert.Equal(3, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM EvidenceRecords;"));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Evidence_append_is_consistent_with_concurrent_attempt_snapshot_changes()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var initializer = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await initializer.AddAsync(task);
+        var attempt = new TaskAttempt(
+            new AttemptId("attempt-evidence-race"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+        await initializer.AppendAttemptAsync(attempt);
+        var runningAttempt = attempt.TransitionTo(TaskAttemptState.Running);
+        var evidence = CreateEvidence("evidence-attempt-race", task.Id, attempt.Id);
+        var repositoryA = await database.CreateInitializedRepositoryAsync();
+        var repositoryB = await database.CreateInitializedRepositoryAsync();
+
+        await System.Threading.Tasks.Task.WhenAll(
+            repositoryA.AppendAttemptAsync(runningAttempt),
+            repositoryB.AddEvidenceAsync(evidence));
+
+        Assert.Equal(
+            [attempt, runningAttempt],
+            await (await database.CreateInitializedRepositoryAsync()).GetAttemptsAsync(task.Id));
+        Assert.Equal([evidence], await repositoryA.GetEvidenceForAttemptAsync(task.Id, attempt.Id));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Failed_evidence_insert_does_not_leave_partial_history()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await repository.AddAsync(task);
+        var evidence = CreateEvidence("evidence-insert-rollback", task.Id);
+        await database.ExecuteSqlAsync("""
+            CREATE TRIGGER FailEvidenceInsert
+            BEFORE INSERT ON EvidenceRecords
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated evidence write failure');
+            END;
+            """);
+
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AddEvidenceAsync(evidence));
+        Assert.Empty(await repository.GetEvidenceAsync(task.Id));
+        Assert.Equal(0, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM EvidenceRecords;"));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Version_three_migration_preserves_existing_execution_history()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await repository.AddAsync(task);
+        var operation = CreateOperation(task, "operation-v3-migration", TaskState.Ready);
+        var transition = CreateStateTransition(
+            task.Id,
+            "transition-v3-migration",
+            TaskState.Proposed,
+            TaskState.Ready,
+            CreatedAt.AddMinutes(1),
+            "Task is ready.");
+        var attempt = new TaskAttempt(
+            new AttemptId("attempt-v3-migration"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+        await repository.ApplyTransitionWithHistoryAsync(operation, transition, attempt);
+        await repository.DisposeAsync();
+        await database.MarkAsLegacyVersionThreeAsync();
+
+        var upgradedRepository = await database.CreateInitializedRepositoryAsync();
+        var restoredTask = await upgradedRepository.GetByIdAsync(task.Id);
+
+        Assert.NotNull(restoredTask);
+        Assert.Equal([operation], restoredTask.AppliedOperations);
+        Assert.Equal([attempt], await upgradedRepository.GetAttemptsAsync(task.Id));
+        Assert.Collection(
+            await upgradedRepository.GetStateTransitionsAsync(task.Id),
+            record =>
+            {
+                Assert.Equal(transition, record.Transition);
+                Assert.Equal(operation.OperationId, record.OperationId);
+                Assert.Equal(attempt.Id, record.AssociatedAttemptId);
+            });
+        Assert.Equal(4, await database.ExecuteScalarAsync<int>(
+            "SELECT Version FROM PersistenceSchemaVersion WHERE Id = 1;"));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Failed_evidence_migration_rolls_back_schema_version_and_existing_data()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await repository.AddAsync(task);
+        var operation = CreateOperation(task, "operation-evidence-migration-rollback", TaskState.Ready);
+        await repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
+        await repository.DisposeAsync();
+        await database.MarkAsLegacyVersionThreeAsync();
+
+        var failingRepository = new SqliteTaskRepository(
+            database.DatabasePath,
+            (fromVersion, toVersion) =>
+            {
+                if (fromVersion == 3 && toVersion == 4)
+                {
+                    throw new InvalidOperationException("Simulated evidence migration failure.");
+                }
+            });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => failingRepository.InitializeAsync());
+        Assert.Equal(3, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
+        Assert.Equal(3, await database.ExecuteScalarAsync<int>(
+            "SELECT Version FROM PersistenceSchemaVersion WHERE Id = 1;"));
+        Assert.Equal(0, await database.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'EvidenceRecords';"));
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM TaskOperations;"));
+
+        var recoveredRepository = await database.CreateInitializedRepositoryAsync();
+        var restoredTask = await recoveredRepository.GetByIdAsync(task.Id);
+        Assert.NotNull(restoredTask);
+        Assert.Equal([operation], restoredTask.AppliedOperations);
+        Assert.Equal(4, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
+    }
+
+    [Fact]
     public async System.Threading.Tasks.Task Concurrent_attempt_creation_preserves_unique_task_attempt_numbers()
     {
         await using var database = await TestDatabase.CreateAsync();
@@ -548,6 +785,7 @@ public sealed class SqliteTaskRepositoryTests
             1,
             TaskAttemptState.Created,
             CreatedAt.AddMinutes(1));
+        var evidence = CreateEvidence("evidence-before-init", task.Id);
 
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetByIdAsync(task.Id));
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AddAsync(task));
@@ -556,6 +794,10 @@ public sealed class SqliteTaskRepositoryTests
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AppendAttemptAsync(attempt));
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetAttemptsAsync(task.Id));
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetStateTransitionsAsync(task.Id));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AddEvidenceAsync(evidence));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetEvidenceAsync(task.Id));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() =>
+            repository.GetEvidenceForAttemptAsync(task.Id, attempt.Id));
         await Assert.ThrowsAsync<TaskPersistenceException>(() =>
             repository.ApplyTransitionWithHistoryAsync(operation, transition, attempt));
 
@@ -570,6 +812,10 @@ public sealed class SqliteTaskRepositoryTests
         await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.AppendAttemptAsync(attempt));
         await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.GetAttemptsAsync(task.Id));
         await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.GetStateTransitionsAsync(task.Id));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.AddEvidenceAsync(evidence));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.GetEvidenceAsync(task.Id));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            repository.GetEvidenceForAttemptAsync(task.Id, attempt.Id));
         await Assert.ThrowsAsync<ObjectDisposedException>(() =>
             repository.ApplyTransitionWithHistoryAsync(operation, transition, attempt));
         await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.InitializeAsync());
@@ -596,7 +842,7 @@ public sealed class SqliteTaskRepositoryTests
         Assert.Single(restored.AppliedOperations);
         Assert.Equal(appliedAt, await database.ExecuteScalarAsync<string>(
             "SELECT AppliedAt FROM PersistenceSchemaVersion WHERE Id = 1;"));
-        Assert.Equal(3, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
+        Assert.Equal(4, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
     }
 
     [Fact]
@@ -618,7 +864,7 @@ public sealed class SqliteTaskRepositoryTests
         Assert.Equal(TaskState.Ready, restored.State);
         Assert.Equal(new TaskRevision(1), restored.Revision);
         Assert.Equal([operation], restored.AppliedOperations);
-        Assert.Equal(3, await database.ExecuteScalarAsync<int>(
+        Assert.Equal(4, await database.ExecuteScalarAsync<int>(
             "SELECT Version FROM PersistenceSchemaVersion WHERE Id = 1;"));
     }
 
@@ -692,7 +938,7 @@ public sealed class SqliteTaskRepositoryTests
         var restoredTask = await recoveredRepository.GetByIdAsync(task.Id);
         Assert.NotNull(restoredTask);
         Assert.Equal([operation], restoredTask.AppliedOperations);
-        Assert.Equal(3, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
+        Assert.Equal(4, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
     }
 
     [Fact]
@@ -728,6 +974,7 @@ public sealed class SqliteTaskRepositoryTests
 
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.InitializeAsync());
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetByIdAsync(new TaskId("missing")));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetEvidenceAsync(new TaskId("missing")));
         Assert.Equal(1, await database.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM PersistenceSchemaVersion WHERE Version = 'invalid';"));
     }
@@ -743,7 +990,7 @@ public sealed class SqliteTaskRepositoryTests
 
         await System.Threading.Tasks.Task.WhenAll(
             Enumerable.Range(0, 8).Select(_ => repository.InitializeAsync()));
-        Assert.Equal([(0, 1), (1, 2), (2, 3)], migrationOrder.ToArray());
+        Assert.Equal([(0, 1), (1, 2), (2, 3), (3, 4)], migrationOrder.ToArray());
 
         var secondDatabase = await TestDatabase.CreateAsync();
         await using (secondDatabase)
@@ -762,7 +1009,7 @@ public sealed class SqliteTaskRepositoryTests
                 repositoryA.InitializeAsync(),
                 repositoryB.InitializeAsync());
 
-            Assert.Equal([(0, 1), (1, 2), (2, 3)], multipleInstanceMigrationOrder.ToArray());
+            Assert.Equal([(0, 1), (1, 2), (2, 3), (3, 4)], multipleInstanceMigrationOrder.ToArray());
             var task = CreateTask();
             await repositoryA.AddAsync(task);
             var sharedTask = await repositoryB.GetByIdAsync(task.Id);
@@ -783,6 +1030,22 @@ public sealed class SqliteTaskRepositoryTests
 
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.InitializeAsync());
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetByIdAsync(new TaskId("missing")));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Evidence_schema_validation_requires_immutable_history_triggers()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var initializedRepository = await database.CreateInitializedRepositoryAsync();
+        await initializedRepository.AddAsync(CreateTask());
+        await initializedRepository.DisposeAsync();
+        await database.ExecuteSqlAsync("DROP TRIGGER EvidenceRecords_NoDelete;");
+        var repository = database.CreateRepository();
+
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.InitializeAsync());
+        await Assert.ThrowsAsync<TaskPersistenceException>(() =>
+            repository.GetEvidenceAsync(new TaskId("missing")));
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM Tasks;"));
     }
 
     [Fact]
@@ -818,9 +1081,10 @@ public sealed class SqliteTaskRepositoryTests
         IEnumerable<StopCondition>? stopConditions = null,
         ChangeBudget? changeBudget = null,
         TaskState state = TaskState.Proposed,
-        TaskRevision? revision = null) =>
+        TaskRevision? revision = null,
+        TaskId? taskId = null) =>
         new(
-            new TaskId("task-persistence"),
+            taskId ?? new TaskId("task-persistence"),
             "Persist task state",
             "Store all domain data and lifecycle history.",
             dependencies ?? [],
@@ -831,6 +1095,21 @@ public sealed class SqliteTaskRepositoryTests
             state,
             CreatedAt,
             revision ?? new TaskRevision(0));
+
+    private static EvidenceRecord CreateEvidence(
+        string evidenceId,
+        TaskId taskId,
+        AttemptId? attemptId = null,
+        string summary = "Build completed successfully.") =>
+        new(
+            new EvidenceId(evidenceId),
+            taskId,
+            EvidenceType.Build,
+            EvidenceSource.Verifier,
+            summary,
+            CreatedAt.AddMinutes(2),
+            attemptId,
+            new EvidenceReference("build-result"));
 
     private static TaskTransitionOperation CreateOperation(
         DomainTask task,
@@ -892,6 +1171,9 @@ public sealed class SqliteTaskRepositoryTests
 
         public async System.Threading.Tasks.Task MarkAsLegacyVersionOneAsync() =>
             await ExecuteSqlAsync("""
+                DROP TRIGGER EvidenceRecords_NoUpdate;
+                DROP TRIGGER EvidenceRecords_NoDelete;
+                DROP TABLE EvidenceRecords;
                 DROP TABLE StateTransitions;
                 DROP TABLE TaskAttemptSnapshots;
                 DROP TABLE TaskAttempts;
@@ -901,11 +1183,23 @@ public sealed class SqliteTaskRepositoryTests
 
         public async System.Threading.Tasks.Task MarkAsLegacyVersionTwoAsync() =>
             await ExecuteSqlAsync("""
+                DROP TRIGGER EvidenceRecords_NoUpdate;
+                DROP TRIGGER EvidenceRecords_NoDelete;
+                DROP TABLE EvidenceRecords;
                 DROP TABLE StateTransitions;
                 DROP TABLE TaskAttemptSnapshots;
                 DROP TABLE TaskAttempts;
                 UPDATE PersistenceSchemaVersion SET Version = 2 WHERE Id = 1;
                 PRAGMA user_version = 2;
+                """);
+
+        public async System.Threading.Tasks.Task MarkAsLegacyVersionThreeAsync() =>
+            await ExecuteSqlAsync("""
+                DROP TRIGGER EvidenceRecords_NoUpdate;
+                DROP TRIGGER EvidenceRecords_NoDelete;
+                DROP TABLE EvidenceRecords;
+                UPDATE PersistenceSchemaVersion SET Version = 3 WHERE Id = 1;
+                PRAGMA user_version = 3;
                 """);
 
         public async System.Threading.Tasks.Task<T> ExecuteScalarAsync<T>(string sql)
