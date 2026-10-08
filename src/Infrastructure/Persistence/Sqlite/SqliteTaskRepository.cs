@@ -8,14 +8,31 @@ using DomainTask = AiGameStudioWorkstation.Core.Domain.Tasks.Task;
 
 namespace AiGameStudioWorkstation.Infrastructure.Persistence.Sqlite;
 
-public sealed class SqliteTaskRepository : ITaskRepository
+public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncDisposable
 {
-    private const int SchemaVersion = 1;
+    private const int InitialSchemaVersion = 1;
+    private const int SchemaVersion = 2;
+    private const string SchemaVersionTable = "PersistenceSchemaVersion";
     private const int MaximumTaskStateValue = (int)TaskState.HumanReviewRequired;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly SchemaMigration[] Migrations =
+    [
+        new(0, 1, MigrateVersionZeroToOneAsync),
+        new(1, 2, ApplySchemaVersionTwoAsync)
+    ];
     private readonly string _connectionString;
+    private readonly string _databasePath;
+    private readonly SemaphoreSlim _initializationLock = new(1, 1);
+    private readonly object _lifecycleLock = new();
+    private readonly Action<int, int>? _migrationTestHook;
+    private PersistenceState _state;
 
     public SqliteTaskRepository(string databasePath)
+        : this(databasePath, migrationTestHook: null)
+    {
+    }
+
+    internal SqliteTaskRepository(string databasePath, Action<int, int>? migrationTestHook)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
         if (string.Equals(databasePath, ":memory:", StringComparison.Ordinal))
@@ -25,9 +42,11 @@ public sealed class SqliteTaskRepository : ITaskRepository
                 nameof(databasePath));
         }
 
+        _databasePath = Path.GetFullPath(databasePath);
+        _migrationTestHook = migrationTestHook;
         var builder = new SqliteConnectionStringBuilder
         {
-            DataSource = Path.GetFullPath(databasePath),
+            DataSource = _databasePath,
             Mode = SqliteOpenMode.ReadWriteCreate,
             ForeignKeys = true,
             Pooling = false
@@ -37,15 +56,32 @@ public sealed class SqliteTaskRepository : ITaskRepository
 
     public async AsyncTask InitializeAsync(CancellationToken cancellationToken = default)
     {
+        await _initializationLock.WaitAsync(cancellationToken);
         try
         {
-            await using var connection = await OpenConnectionAsync(cancellationToken);
-            await using (var journalCommand = connection.CreateCommand())
+            lock (_lifecycleLock)
             {
-                journalCommand.CommandText = "PRAGMA journal_mode = WAL;";
-                await journalCommand.ExecuteNonQueryAsync(cancellationToken);
+                if (_state == PersistenceState.Disposed)
+                {
+                    throw new ObjectDisposedException(nameof(SqliteTaskRepository));
+                }
+
+                if (_state == PersistenceState.Ready)
+                {
+                    return;
+                }
+
+                if (_state == PersistenceState.Failed)
+                {
+                    throw new TaskPersistenceException(
+                        "Persistence initialization previously failed; this repository instance is unavailable.");
+                }
+
+                _state = PersistenceState.Initializing;
             }
 
+            await ValidateDatabaseLocationAsync();
+            await using var connection = await OpenConnectionAsync(cancellationToken);
             using var transaction = connection.BeginTransaction(deferred: false);
             var version = await ReadSchemaVersionAsync(connection, transaction, cancellationToken);
             if (version > SchemaVersion)
@@ -54,22 +90,71 @@ public sealed class SqliteTaskRepository : ITaskRepository
                     $"Database schema version {version} is newer than the supported version {SchemaVersion}.");
             }
 
-            if (version == 0)
+            while (version < SchemaVersion)
             {
-                await CreateSchemaAsync(connection, transaction, cancellationToken);
-                await SetSchemaVersionAsync(connection, transaction, cancellationToken);
+                var migration = Migrations.SingleOrDefault(candidate => candidate.FromVersion == version);
+                if (migration is null || migration.ToVersion != version + 1)
+                {
+                    throw new TaskPersistenceException(
+                        $"No ordered migration is defined from schema version {version}.");
+                }
+
+                if (version == InitialSchemaVersion)
+                {
+                    await ValidateVersionOneSchemaAsync(connection, transaction, cancellationToken);
+                }
+
+                await migration.Apply(connection, transaction, cancellationToken);
+                _migrationTestHook?.Invoke(version, migration.ToVersion);
+                version = migration.ToVersion;
             }
 
             await transaction.CommitAsync(cancellationToken);
+            await ValidateCurrentSchemaAsync(connection, cancellationToken);
+
+            await using (var journalCommand = connection.CreateCommand())
+            {
+                journalCommand.CommandText = "PRAGMA journal_mode = WAL;";
+                await journalCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            lock (_lifecycleLock)
+            {
+                if (_state != PersistenceState.Disposed)
+                {
+                    _state = PersistenceState.Ready;
+                }
+            }
         }
         catch (SqliteException exception)
         {
+            SetFailedUnlessDisposed();
             throw new TaskPersistenceException("Failed to initialize the SQLite task schema.", exception);
+        }
+        catch (Exception exception) when (
+            exception is IOException
+            or UnauthorizedAccessException
+            or System.Security.SecurityException)
+        {
+            SetFailedUnlessDisposed();
+            throw new TaskPersistenceException(
+                "Failed to access the configured SQLite database location.",
+                exception);
+        }
+        catch
+        {
+            SetFailedUnlessDisposed();
+            throw;
+        }
+        finally
+        {
+            _initializationLock.Release();
         }
     }
 
     public async AsyncTask AddAsync(DomainTask task, CancellationToken cancellationToken = default)
     {
+        EnsureReady();
         ArgumentNullException.ThrowIfNull(task);
         if (task.AppliedOperations.Count != 0 || task.UpdatedAt != task.CreatedAt)
         {
@@ -118,6 +203,7 @@ public sealed class SqliteTaskRepository : ITaskRepository
         TaskId taskId,
         CancellationToken cancellationToken = default)
     {
+        EnsureReady();
         ArgumentNullException.ThrowIfNull(taskId);
 
         try
@@ -139,6 +225,7 @@ public sealed class SqliteTaskRepository : ITaskRepository
         DateTimeOffset updatedAt,
         CancellationToken cancellationToken = default)
     {
+        EnsureReady();
         ArgumentNullException.ThrowIfNull(operation);
 
         try
@@ -184,6 +271,84 @@ public sealed class SqliteTaskRepository : ITaskRepository
         }
     }
 
+    public void Dispose()
+    {
+        _initializationLock.Wait();
+        try
+        {
+            lock (_lifecycleLock)
+            {
+                _state = PersistenceState.Disposed;
+            }
+        }
+        finally
+        {
+            _initializationLock.Release();
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await _initializationLock.WaitAsync();
+        try
+        {
+            lock (_lifecycleLock)
+            {
+                _state = PersistenceState.Disposed;
+            }
+        }
+        finally
+        {
+            _initializationLock.Release();
+        }
+    }
+
+    private void EnsureReady()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_state == PersistenceState.Disposed)
+            {
+                throw new ObjectDisposedException(nameof(SqliteTaskRepository));
+            }
+
+            if (_state != PersistenceState.Ready)
+            {
+                throw new TaskPersistenceException(
+                    $"Persistence is unavailable while its lifecycle state is '{_state}'.");
+            }
+        }
+    }
+
+    private void SetFailedUnlessDisposed()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_state != PersistenceState.Disposed)
+            {
+                _state = PersistenceState.Failed;
+            }
+        }
+    }
+
+    private AsyncTask ValidateDatabaseLocationAsync()
+    {
+        if (Directory.Exists(_databasePath))
+        {
+            throw new TaskPersistenceException(
+                "The configured SQLite database path refers to a directory, not a database file.");
+        }
+
+        var parentDirectory = Path.GetDirectoryName(_databasePath);
+        if (string.IsNullOrWhiteSpace(parentDirectory) || !Directory.Exists(parentDirectory))
+        {
+            throw new TaskPersistenceException(
+                "The parent directory for the configured SQLite database does not exist.");
+        }
+
+        return AsyncTask.CompletedTask;
+    }
+
     private async System.Threading.Tasks.Task<SqliteConnection> OpenConnectionAsync(CancellationToken cancellationToken)
     {
         var connection = new SqliteConnection(_connectionString);
@@ -196,11 +361,375 @@ public sealed class SqliteTaskRepository : ITaskRepository
         SqliteTransaction transaction,
         CancellationToken cancellationToken)
     {
+        await using (var metadataCommand = connection.CreateCommand())
+        {
+            metadataCommand.Transaction = transaction;
+            metadataCommand.CommandText = """
+                SELECT COUNT(*)
+                FROM sqlite_schema
+                WHERE type = 'table' AND name = $tableName;
+                """;
+            metadataCommand.Parameters.AddWithValue("$tableName", SchemaVersionTable);
+            var metadataTableExists = Convert.ToInt32(
+                await metadataCommand.ExecuteScalarAsync(cancellationToken),
+                CultureInfo.InvariantCulture) == 1;
+
+            if (metadataTableExists)
+            {
+                await using var versionCommand = connection.CreateCommand();
+                versionCommand.Transaction = transaction;
+                versionCommand.CommandText = $"""
+                    SELECT Id, Version, AppliedAt
+                    FROM {SchemaVersionTable}
+                    ORDER BY Id;
+                    """;
+                await using var reader = await versionCommand.ExecuteReaderAsync(cancellationToken);
+                if (!await reader.ReadAsync(cancellationToken)
+                    || reader.GetInt32(0) != 1)
+                {
+                    throw new TaskPersistenceException(
+                        "The SQLite schema-version metadata must contain exactly one row with Id 1.");
+                }
+
+                int schemaVersion;
+                try
+                {
+                    schemaVersion = reader.GetInt32(1);
+                    _ = DateTimeOffset.ParseExact(
+                        reader.GetString(2),
+                        "O",
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.None);
+                }
+                catch (Exception exception) when (
+                    exception is FormatException
+                    or InvalidCastException
+                    or InvalidOperationException
+                    or OverflowException)
+                {
+                    throw new TaskPersistenceException(
+                        "The SQLite schema-version metadata contains invalid values.",
+                        exception);
+                }
+
+                if (schemaVersion < 1 || await reader.ReadAsync(cancellationToken))
+                {
+                    throw new TaskPersistenceException(
+                        "The SQLite schema-version metadata is malformed.");
+                }
+
+                return schemaVersion;
+            }
+        }
+
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = "PRAGMA user_version;";
         var value = await command.ExecuteScalarAsync(cancellationToken);
-        return Convert.ToInt32(value, CultureInfo.InvariantCulture);
+        var legacyVersion = Convert.ToInt32(value, CultureInfo.InvariantCulture);
+        if (legacyVersion is 0 or 1)
+        {
+            return legacyVersion;
+        }
+
+        throw new TaskPersistenceException(
+            $"The database has unrecognized legacy schema version {legacyVersion}; it will not be downgraded or recreated.");
+    }
+
+    private static AsyncTask ValidateVersionOneSchemaAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken) =>
+        ValidateTaskSchemaObjectsAsync(
+            connection,
+            transaction,
+            requireVersionMetadata: false,
+            cancellationToken);
+
+    private static async AsyncTask ValidateCurrentSchemaAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await ValidateTaskSchemaObjectsAsync(
+            connection,
+            transaction: null,
+            requireVersionMetadata: true,
+            cancellationToken);
+
+        await using (var integrityCommand = connection.CreateCommand())
+        {
+            integrityCommand.CommandText = "PRAGMA integrity_check;";
+            await using var integrityReader = await integrityCommand.ExecuteReaderAsync(cancellationToken);
+            if (!await integrityReader.ReadAsync(cancellationToken)
+                || !string.Equals(integrityReader.GetString(0), "ok", StringComparison.OrdinalIgnoreCase)
+                || await integrityReader.ReadAsync(cancellationToken))
+            {
+                throw new TaskPersistenceException("The SQLite database integrity check failed.");
+            }
+        }
+
+        await using var foreignKeyCommand = connection.CreateCommand();
+        foreignKeyCommand.CommandText = "PRAGMA foreign_key_check;";
+        await using var foreignKeyReader = await foreignKeyCommand.ExecuteReaderAsync(cancellationToken);
+        if (await foreignKeyReader.ReadAsync(cancellationToken))
+        {
+            throw new TaskPersistenceException("The SQLite database contains a foreign-key integrity violation.");
+        }
+    }
+
+    private static async AsyncTask ValidateTaskSchemaObjectsAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        bool requireVersionMetadata,
+        CancellationToken cancellationToken)
+    {
+        var tasksColumns = await ReadTableColumnsAsync(connection, transaction, "Tasks", cancellationToken);
+        RequireColumns(
+            "Tasks",
+            tasksColumns,
+            [
+                "TaskId", "Intent", "Description", "DependenciesJson", "ScopeEntriesJson",
+                "AcceptanceCriteriaJson", "StopConditionsJson",
+                "MaxProductionFilesChanged", "MaxTestFilesChanged", "MaxTotalFilesChanged",
+                "MaxDependencyAdditions", "MaxFileDeletions", "InitialState", "InitialRevision",
+                "State", "Revision", "CreatedAt", "UpdatedAt"
+            ]);
+        if (!tasksColumns.Any(column =>
+                string.Equals(column.Name, "TaskId", StringComparison.OrdinalIgnoreCase)
+                && column.PrimaryKeyPosition == 1))
+        {
+            throw new TaskPersistenceException("The Tasks table is missing its TaskId primary key.");
+        }
+
+        var operationColumns = await ReadTableColumnsAsync(
+            connection,
+            transaction,
+            "TaskOperations",
+            cancellationToken);
+        RequireColumns(
+            "TaskOperations",
+            operationColumns,
+            [
+                "TaskId", "OperationId", "CorrelationId", "ExpectedRevision", "PreviousState",
+                "TargetState", "ResultingRevision", "ResultingState", "AppliedAt"
+            ]);
+
+        var uniqueIndexes = await ReadUniqueIndexesAsync(
+            connection,
+            transaction,
+            "TaskOperations",
+            cancellationToken);
+        if (!uniqueIndexes.Any(index => index.Columns.SequenceEqual(
+                ["TaskId", "OperationId"],
+                StringComparer.OrdinalIgnoreCase))
+            || !uniqueIndexes.Any(index => index.Columns.SequenceEqual(
+                ["TaskId", "ResultingRevision"],
+                StringComparer.OrdinalIgnoreCase)))
+        {
+            throw new TaskPersistenceException(
+                "The TaskOperations table is missing its required unique operation and revision constraints.");
+        }
+
+        await ValidateForeignKeyAsync(connection, transaction, cancellationToken);
+        await ValidateImmutableHistoryTriggersAsync(connection, transaction, cancellationToken);
+
+        if (!requireVersionMetadata)
+        {
+            return;
+        }
+
+        var versionColumns = await ReadTableColumnsAsync(
+            connection,
+            transaction,
+            SchemaVersionTable,
+            cancellationToken);
+        RequireColumns(SchemaVersionTable, versionColumns, ["Id", "Version", "AppliedAt"]);
+        if (!versionColumns.Any(column =>
+                string.Equals(column.Name, "Id", StringComparison.OrdinalIgnoreCase)
+                && column.PrimaryKeyPosition == 1))
+        {
+            throw new TaskPersistenceException(
+                "The schema-version metadata is missing its singleton primary key.");
+        }
+    }
+
+    private static async System.Threading.Tasks.Task<IReadOnlyList<TableColumn>> ReadTableColumnsAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"PRAGMA table_info(\"{tableName}\");";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var columns = new List<TableColumn>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            columns.Add(new TableColumn(reader.GetString(1), reader.GetInt32(5)));
+        }
+
+        if (columns.Count == 0)
+        {
+            throw new TaskPersistenceException($"Required SQLite table '{tableName}' does not exist.");
+        }
+
+        return columns;
+    }
+
+    private static void RequireColumns(
+        string tableName,
+        IReadOnlyList<TableColumn> actual,
+        IReadOnlyList<string> required)
+    {
+        var actualNames = actual.Select(column => column.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (required.Any(column => !actualNames.Contains(column)))
+        {
+            throw new TaskPersistenceException(
+                $"SQLite table '{tableName}' is missing one or more required columns.");
+        }
+    }
+
+    private static async System.Threading.Tasks.Task<IReadOnlyList<UniqueIndex>> ReadUniqueIndexesAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string tableName,
+        CancellationToken cancellationToken)
+    {
+        var indexes = new List<UniqueIndex>();
+        var indexNames = new List<string>();
+        await using var listCommand = connection.CreateCommand();
+        listCommand.Transaction = transaction;
+        listCommand.CommandText = $"PRAGMA index_list(\"{tableName}\");";
+        await using (var listReader = await listCommand.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await listReader.ReadAsync(cancellationToken))
+            {
+                if (listReader.GetInt32(2) == 1)
+                {
+                    indexNames.Add(listReader.GetString(1));
+                }
+            }
+        }
+
+        foreach (var indexName in indexNames)
+        {
+            var escapedName = indexName.Replace("\"", "\"\"", StringComparison.Ordinal);
+            await using var indexCommand = connection.CreateCommand();
+            indexCommand.Transaction = transaction;
+            indexCommand.CommandText = $"PRAGMA index_info(\"{escapedName}\");";
+            await using var indexReader = await indexCommand.ExecuteReaderAsync(cancellationToken);
+            var columns = new List<string>();
+            while (await indexReader.ReadAsync(cancellationToken))
+            {
+                columns.Add(indexReader.GetString(2));
+            }
+
+            indexes.Add(new UniqueIndex(columns));
+        }
+
+        return indexes;
+    }
+
+    private static async AsyncTask ValidateForeignKeyAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "PRAGMA foreign_key_list(\"TaskOperations\");";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            if (string.Equals(reader.GetString(2), "Tasks", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(reader.GetString(3), "TaskId", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(reader.GetString(4), "TaskId", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(reader.GetString(6), "RESTRICT", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+
+        throw new TaskPersistenceException(
+            "The TaskOperations table is missing its required restricted TaskId foreign key.");
+    }
+
+    private static async AsyncTask ValidateImmutableHistoryTriggersAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT name, sql
+            FROM sqlite_schema
+            WHERE type = 'trigger'
+              AND name IN ('TaskOperations_NoUpdate', 'TaskOperations_NoDelete');
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var verifiedUpdateTrigger = false;
+        var verifiedDeleteTrigger = false;
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var name = reader.GetString(0);
+            var sql = reader.GetString(1);
+            if (name == "TaskOperations_NoUpdate"
+                && sql.Contains("BEFORE UPDATE ON TaskOperations", StringComparison.OrdinalIgnoreCase))
+            {
+                verifiedUpdateTrigger = true;
+            }
+
+            if (name == "TaskOperations_NoDelete"
+                && sql.Contains("BEFORE DELETE ON TaskOperations", StringComparison.OrdinalIgnoreCase))
+            {
+                verifiedDeleteTrigger = true;
+            }
+        }
+
+        if (!verifiedUpdateTrigger || !verifiedDeleteTrigger)
+        {
+            throw new TaskPersistenceException(
+                "The TaskOperations immutable-history triggers are missing or invalid.");
+        }
+    }
+
+    private static async AsyncTask EnsureDatabaseIsEmptyAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT COUNT(*)
+            FROM sqlite_schema
+            WHERE name NOT LIKE 'sqlite_%'
+              AND type IN ('table', 'index', 'view', 'trigger');
+            """;
+        var objectCount = Convert.ToInt32(
+            await command.ExecuteScalarAsync(cancellationToken),
+            CultureInfo.InvariantCulture);
+        if (objectCount != 0)
+        {
+            throw new TaskPersistenceException(
+                "A database without an explicit schema version must be empty before initialization.");
+        }
+    }
+
+    private static async AsyncTask MigrateVersionZeroToOneAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await EnsureDatabaseIsEmptyAsync(connection, transaction, cancellationToken);
+        await CreateSchemaAsync(connection, transaction, cancellationToken);
+        await SetLegacySchemaVersionAsync(
+            connection,
+            transaction,
+            InitialSchemaVersion,
+            cancellationToken);
     }
 
     private static async AsyncTask CreateSchemaAsync(
@@ -264,14 +793,42 @@ public sealed class SqliteTaskRepository : ITaskRepository
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static async AsyncTask SetSchemaVersionAsync(
+    private static async AsyncTask ApplySchemaVersionTwoAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = $"PRAGMA user_version = {SchemaVersion};";
+        command.CommandText = $"""
+            CREATE TABLE IF NOT EXISTS {SchemaVersionTable} (
+                Id INTEGER NOT NULL PRIMARY KEY CHECK (Id = 1),
+                Version INTEGER NOT NULL CHECK (Version > 0),
+                AppliedAt TEXT NOT NULL
+            );
+
+            INSERT INTO {SchemaVersionTable} (Id, Version, AppliedAt)
+            VALUES (1, $version, $appliedAt)
+            ON CONFLICT(Id) DO UPDATE SET
+                Version = excluded.Version,
+                AppliedAt = excluded.AppliedAt;
+
+            PRAGMA user_version = {SchemaVersion};
+            """;
+        command.Parameters.AddWithValue("$version", SchemaVersion);
+        command.Parameters.AddWithValue("$appliedAt", FormatTimestamp(DateTimeOffset.UtcNow));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async AsyncTask SetLegacySchemaVersionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        int version,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"PRAGMA user_version = {version};";
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -716,4 +1273,27 @@ public sealed class SqliteTaskRepository : ITaskRepository
     private sealed record AcceptanceCriterionData(string Id, string Description, bool IsMandatory);
 
     private sealed record StopConditionData(string Id, string Description, bool IsMandatory);
+
+    private sealed record TableColumn(string Name, int PrimaryKeyPosition);
+
+    private sealed record UniqueIndex(IReadOnlyList<string> Columns);
+
+    private delegate AsyncTask SchemaMigrationAction(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken);
+
+    private sealed record SchemaMigration(
+        int FromVersion,
+        int ToVersion,
+        SchemaMigrationAction Apply);
+
+    private enum PersistenceState
+    {
+        NotInitialized,
+        Initializing,
+        Ready,
+        Failed,
+        Disposed
+    }
 }

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using AiGameStudioWorkstation.Application.Tasks.Persistence;
 using AiGameStudioWorkstation.Core.Domain.Tasks;
 using AiGameStudioWorkstation.Infrastructure.Persistence.Sqlite;
@@ -14,7 +15,7 @@ public sealed class SqliteTaskRepositoryTests
     public async System.Threading.Tasks.Task Task_round_trip_preserves_all_domain_data()
     {
         await using var database = await TestDatabase.CreateAsync();
-        var repository = database.CreateRepository();
+        var repository = await database.CreateInitializedRepositoryAsync();
         var task = CreateTask(
             dependencies: [new TaskId("foundation-004")],
             scope: new TaskScope(["src/Core", "tests/Core.Tests"]),
@@ -23,7 +24,7 @@ public sealed class SqliteTaskRepositoryTests
             changeBudget: new ChangeBudget(3, 2, 5, 1, 1));
 
         await repository.AddAsync(task);
-        var restored = await database.CreateRepository().GetByIdAsync(task.Id);
+        var restored = await (await database.CreateInitializedRepositoryAsync()).GetByIdAsync(task.Id);
 
         Assert.NotNull(restored);
         Assert.Equal(task.Id, restored.Id);
@@ -46,7 +47,8 @@ public sealed class SqliteTaskRepositoryTests
     {
         await using var database = await TestDatabase.CreateAsync();
         var initialTask = CreateTask();
-        await database.CreateRepository().AddAsync(initialTask);
+        var initialRepository = await database.CreateInitializedRepositoryAsync();
+        await initialRepository.AddAsync(initialTask);
         var operation = CreateOperation(initialTask, "operation-durable", TaskState.Ready);
         operation = new TaskTransitionOperation(
             operation.TaskId,
@@ -56,8 +58,9 @@ public sealed class SqliteTaskRepositoryTests
             new CorrelationId("correlation-durable"));
         var appliedAt = CreatedAt.AddMinutes(1);
 
-        var result = await database.CreateRepository().ApplyTransitionAsync(operation, appliedAt);
-        var restartedRepository = database.CreateRepository();
+        var result = await initialRepository.ApplyTransitionAsync(operation, appliedAt);
+        await initialRepository.DisposeAsync();
+        var restartedRepository = await database.CreateInitializedRepositoryAsync();
         var restored = await restartedRepository.GetByIdAsync(initialTask.Id);
         var replay = await restartedRepository.ApplyTransitionAsync(operation, CreatedAt);
         var conflictingReplay = await restartedRepository.ApplyTransitionAsync(
@@ -89,19 +92,22 @@ public sealed class SqliteTaskRepositoryTests
     {
         await using var database = await TestDatabase.CreateAsync();
         var task = CreateTask();
-        await database.CreateRepository().AddAsync(task);
+        var initialRepository = await database.CreateInitializedRepositoryAsync();
+        await initialRepository.AddAsync(task);
         var first = CreateOperation(task, "operation-ready", TaskState.Ready);
         var second = CreateOperation(task, "operation-cancel", TaskState.Cancelled);
+        var repositoryA = await database.CreateInitializedRepositoryAsync();
+        var repositoryB = await database.CreateInitializedRepositoryAsync();
 
         var results = await System.Threading.Tasks.Task.WhenAll(
-            database.CreateRepository().ApplyTransitionAsync(first, CreatedAt.AddMinutes(1)),
-            database.CreateRepository().ApplyTransitionAsync(second, CreatedAt.AddMinutes(2)));
+            repositoryA.ApplyTransitionAsync(first, CreatedAt.AddMinutes(1)),
+            repositoryB.ApplyTransitionAsync(second, CreatedAt.AddMinutes(2)));
 
         Assert.Single(results, result => result.Status == TaskOperationStatus.Applied);
         Assert.Single(results, result =>
             result.Status == TaskOperationStatus.Rejected
             && result.Rejection == TaskOperationRejection.StaleRevision);
-        var persisted = await database.CreateRepository().GetByIdAsync(task.Id);
+        var persisted = await (await database.CreateInitializedRepositoryAsync()).GetByIdAsync(task.Id);
         Assert.NotNull(persisted);
         Assert.Equal(new TaskRevision(1), persisted.Revision);
         Assert.Single(persisted.AppliedOperations);
@@ -112,16 +118,19 @@ public sealed class SqliteTaskRepositoryTests
     {
         await using var database = await TestDatabase.CreateAsync();
         var task = CreateTask();
-        await database.CreateRepository().AddAsync(task);
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
         var operation = CreateOperation(task, "operation-race", TaskState.Ready);
+        var repositoryA = await database.CreateInitializedRepositoryAsync();
+        var repositoryB = await database.CreateInitializedRepositoryAsync();
 
         var results = await System.Threading.Tasks.Task.WhenAll(
-            database.CreateRepository().ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1)),
-            database.CreateRepository().ApplyTransitionAsync(operation, CreatedAt.AddMinutes(2)));
+            repositoryA.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1)),
+            repositoryB.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(2)));
 
         Assert.Single(results, result => result.Status == TaskOperationStatus.Applied);
         Assert.Single(results, result => result.Status == TaskOperationStatus.AlreadyApplied);
-        var persisted = await database.CreateRepository().GetByIdAsync(task.Id);
+        var persisted = await (await database.CreateInitializedRepositoryAsync()).GetByIdAsync(task.Id);
         Assert.NotNull(persisted);
         Assert.Equal(new TaskRevision(1), persisted.Revision);
         Assert.Single(persisted.AppliedOperations);
@@ -132,13 +141,14 @@ public sealed class SqliteTaskRepositoryTests
     {
         await using var database = await TestDatabase.CreateAsync();
         var task = CreateTask(state: TaskState.InProgress, revision: new TaskRevision(4));
-        await database.CreateRepository().AddAsync(task);
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
         var invalidOperation = CreateOperation(task, "operation-invalid", TaskState.Accepted);
 
-        var result = await database.CreateRepository().ApplyTransitionAsync(
+        var result = await repository.ApplyTransitionAsync(
             invalidOperation,
             CreatedAt.AddMinutes(1));
-        var persisted = await database.CreateRepository().GetByIdAsync(task.Id);
+        var persisted = await repository.GetByIdAsync(task.Id);
 
         Assert.Equal(TaskOperationStatus.Rejected, result.Status);
         Assert.Equal(TaskOperationRejection.InvalidTransition, result.Rejection);
@@ -153,7 +163,8 @@ public sealed class SqliteTaskRepositoryTests
     {
         await using var database = await TestDatabase.CreateAsync();
         var task = CreateTask();
-        await database.CreateRepository().AddAsync(task);
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
         await database.ExecuteSqlAsync("""
             CREATE TRIGGER FailTaskOperationInsert
             BEFORE INSERT ON TaskOperations
@@ -162,11 +173,10 @@ public sealed class SqliteTaskRepositoryTests
             END;
             """);
         var operation = CreateOperation(task, "operation-rollback", TaskState.Ready);
-
         await Assert.ThrowsAsync<TaskPersistenceException>(() =>
-            database.CreateRepository().ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1)));
+            repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1)));
 
-        var persisted = await database.CreateRepository().GetByIdAsync(task.Id);
+        var persisted = await repository.GetByIdAsync(task.Id);
         Assert.NotNull(persisted);
         Assert.Equal(TaskState.Proposed, persisted.State);
         Assert.Equal(new TaskRevision(0), persisted.Revision);
@@ -179,13 +189,14 @@ public sealed class SqliteTaskRepositoryTests
     {
         await using var database = await TestDatabase.CreateAsync();
         var task = CreateTask();
-        await database.CreateRepository().AddAsync(task);
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
         await database.ExecuteSqlAsync(
             "UPDATE Tasks SET DependenciesJson = 'not-json' WHERE TaskId = $taskId;",
             ("$taskId", task.Id.Value));
 
         await Assert.ThrowsAsync<TaskDataCorruptionException>(() =>
-            database.CreateRepository().GetByIdAsync(task.Id));
+            repository.GetByIdAsync(task.Id));
     }
 
     [Fact]
@@ -193,9 +204,10 @@ public sealed class SqliteTaskRepositoryTests
     {
         await using var database = await TestDatabase.CreateAsync();
         var task = CreateTask();
-        await database.CreateRepository().AddAsync(task);
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
         var operation = CreateOperation(task, "operation-immutable", TaskState.Ready);
-        await database.CreateRepository().ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
+        await repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
 
         await Assert.ThrowsAsync<SqliteException>(() => database.ExecuteSqlAsync(
             "UPDATE TaskOperations SET TargetState = $target WHERE TaskId = $taskId AND OperationId = $operationId;",
@@ -213,9 +225,10 @@ public sealed class SqliteTaskRepositoryTests
     {
         await using var database = await TestDatabase.CreateAsync();
         var task = CreateTask();
-        await database.CreateRepository().AddAsync(task);
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
         var operation = CreateOperation(task, "operation-corrupt", TaskState.Ready);
-        await database.CreateRepository().ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
+        await repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
         await database.ExecuteSqlAsync(
             """
             DROP TRIGGER TaskOperations_NoUpdate;
@@ -227,7 +240,7 @@ public sealed class SqliteTaskRepositoryTests
             ("$operationId", operation.OperationId.Value));
 
         await Assert.ThrowsAsync<TaskDataCorruptionException>(() =>
-            database.CreateRepository().GetByIdAsync(task.Id));
+            repository.GetByIdAsync(task.Id));
     }
 
     [Fact]
@@ -235,9 +248,10 @@ public sealed class SqliteTaskRepositoryTests
     {
         await using var database = await TestDatabase.CreateAsync();
         var task = CreateTask();
-        await database.CreateRepository().AddAsync(task);
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
         var operation = CreateOperation(task, "operation-invalid-history", TaskState.Ready);
-        await database.CreateRepository().ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
+        await repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
         await database.ExecuteSqlAsync(
             """
             DROP TRIGGER TaskOperations_NoUpdate;
@@ -251,7 +265,230 @@ public sealed class SqliteTaskRepositoryTests
             ("$operationId", operation.OperationId.Value));
 
         await Assert.ThrowsAsync<TaskDataCorruptionException>(() =>
-            database.CreateRepository().GetByIdAsync(task.Id));
+            repository.GetByIdAsync(task.Id));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Repository_operations_require_successful_initialization_and_reject_disposal()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = database.CreateRepository();
+        var task = CreateTask();
+        var operation = CreateOperation(task, "operation-before-init", TaskState.Ready);
+
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetByIdAsync(task.Id));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AddAsync(task));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() =>
+            repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1)));
+
+        await repository.InitializeAsync();
+        await repository.AddAsync(task);
+        await repository.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.GetByIdAsync(task.Id));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.AddAsync(CreateTask()));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1)));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.InitializeAsync());
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Repeated_initialization_preserves_current_schema_and_data()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await repository.AddAsync(task);
+        var operation = CreateOperation(task, "operation-repeat-init", TaskState.Ready);
+        await repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
+        var appliedAt = await database.ExecuteScalarAsync<string>(
+            "SELECT AppliedAt FROM PersistenceSchemaVersion WHERE Id = 1;");
+
+        await repository.InitializeAsync();
+        await repository.InitializeAsync();
+
+        var restored = await repository.GetByIdAsync(task.Id);
+        Assert.NotNull(restored);
+        Assert.Equal(new TaskRevision(1), restored.Revision);
+        Assert.Single(restored.AppliedOperations);
+        Assert.Equal(appliedAt, await database.ExecuteScalarAsync<string>(
+            "SELECT AppliedAt FROM PersistenceSchemaVersion WHERE Id = 1;"));
+        Assert.Equal(2, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Legacy_v1_database_migrates_without_rewriting_task_history()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await repository.AddAsync(task);
+        var operation = CreateOperation(task, "operation-legacy-v1", TaskState.Ready);
+        await repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
+        await repository.DisposeAsync();
+        await database.MarkAsLegacyVersionOneAsync();
+
+        var upgradedRepository = await database.CreateInitializedRepositoryAsync();
+        var restored = await upgradedRepository.GetByIdAsync(task.Id);
+
+        Assert.NotNull(restored);
+        Assert.Equal(TaskState.Ready, restored.State);
+        Assert.Equal(new TaskRevision(1), restored.Revision);
+        Assert.Equal([operation], restored.AppliedOperations);
+        Assert.Equal(2, await database.ExecuteScalarAsync<int>(
+            "SELECT Version FROM PersistenceSchemaVersion WHERE Id = 1;"));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Failed_migration_rolls_back_and_keeps_legacy_task_data()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await repository.AddAsync(task);
+        var operation = CreateOperation(task, "operation-migration-rollback", TaskState.Ready);
+        await repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
+        await repository.DisposeAsync();
+        await database.MarkAsLegacyVersionOneAsync();
+
+        var failingRepository = new SqliteTaskRepository(
+            database.DatabasePath,
+            (fromVersion, toVersion) =>
+            {
+                if (fromVersion == 1 && toVersion == 2)
+                {
+                    throw new InvalidOperationException("Simulated migration failure.");
+                }
+            });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => failingRepository.InitializeAsync());
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => failingRepository.GetByIdAsync(task.Id));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => failingRepository.InitializeAsync());
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
+        Assert.Equal(0, await database.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'PersistenceSchemaVersion';"));
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM Tasks;"));
+
+        var recoveredRepository = await database.CreateInitializedRepositoryAsync();
+        var restored = await recoveredRepository.GetByIdAsync(task.Id);
+        Assert.NotNull(restored);
+        Assert.Equal([operation], restored.AppliedOperations);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Unsupported_future_schema_fails_closed_without_modifying_data()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var initializedRepository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await initializedRepository.AddAsync(task);
+        await initializedRepository.DisposeAsync();
+        await database.ExecuteSqlAsync(
+            "UPDATE PersistenceSchemaVersion SET Version = 5 WHERE Id = 1;");
+        var repository = database.CreateRepository();
+
+        var exception = await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.InitializeAsync());
+
+        Assert.Contains("newer", exception.Message, StringComparison.OrdinalIgnoreCase);
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetByIdAsync(task.Id));
+        Assert.Equal(5, await database.ExecuteScalarAsync<int>(
+            "SELECT Version FROM PersistenceSchemaVersion WHERE Id = 1;"));
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM Tasks;"));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Malformed_schema_version_fails_closed()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var initializedRepository = await database.CreateInitializedRepositoryAsync();
+        await initializedRepository.DisposeAsync();
+        await database.ExecuteSqlAsync(
+            "UPDATE PersistenceSchemaVersion SET Version = 'invalid' WHERE Id = 1;");
+        var repository = database.CreateRepository();
+
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.InitializeAsync());
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetByIdAsync(new TaskId("missing")));
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM PersistenceSchemaVersion WHERE Version = 'invalid';"));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Concurrent_initialization_is_serialized_for_one_and_multiple_instances()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var migrationOrder = new ConcurrentQueue<(int FromVersion, int ToVersion)>();
+        var repository = new SqliteTaskRepository(
+            database.DatabasePath,
+            (fromVersion, toVersion) => migrationOrder.Enqueue((fromVersion, toVersion)));
+
+        await System.Threading.Tasks.Task.WhenAll(
+            Enumerable.Range(0, 8).Select(_ => repository.InitializeAsync()));
+        Assert.Equal([(0, 1), (1, 2)], migrationOrder.ToArray());
+
+        var secondDatabase = await TestDatabase.CreateAsync();
+        await using (secondDatabase)
+        {
+            var multipleInstanceMigrationOrder = new ConcurrentQueue<(int FromVersion, int ToVersion)>();
+            var repositoryA = new SqliteTaskRepository(
+                secondDatabase.DatabasePath,
+                (fromVersion, toVersion) =>
+                    multipleInstanceMigrationOrder.Enqueue((fromVersion, toVersion)));
+            var repositoryB = new SqliteTaskRepository(
+                secondDatabase.DatabasePath,
+                (fromVersion, toVersion) =>
+                    multipleInstanceMigrationOrder.Enqueue((fromVersion, toVersion)));
+
+            await System.Threading.Tasks.Task.WhenAll(
+                repositoryA.InitializeAsync(),
+                repositoryB.InitializeAsync());
+
+            Assert.Equal([(0, 1), (1, 2)], multipleInstanceMigrationOrder.ToArray());
+            var task = CreateTask();
+            await repositoryA.AddAsync(task);
+            var sharedTask = await repositoryB.GetByIdAsync(task.Id);
+            Assert.NotNull(sharedTask);
+            Assert.Equal(task.Id, sharedTask.Id);
+            Assert.Equal(task.State, sharedTask.State);
+        }
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Schema_validation_failure_prevents_repository_use()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var initializedRepository = await database.CreateInitializedRepositoryAsync();
+        await initializedRepository.DisposeAsync();
+        await database.ExecuteSqlAsync("DROP TRIGGER TaskOperations_NoDelete;");
+        var repository = database.CreateRepository();
+
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.InitializeAsync());
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetByIdAsync(new TaskId("missing")));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Corrupt_database_fails_integrity_validation_without_recreation()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var initializedRepository = await database.CreateInitializedRepositoryAsync();
+        await initializedRepository.DisposeAsync();
+        const string corruptedContent = "not a SQLite database";
+        await File.WriteAllTextAsync(database.DatabasePath, corruptedContent);
+        var repository = database.CreateRepository();
+
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.InitializeAsync());
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetByIdAsync(new TaskId("missing")));
+        Assert.Equal(corruptedContent, await File.ReadAllTextAsync(database.DatabasePath));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Invalid_database_location_fails_without_creating_directories()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = new SqliteTaskRepository(database.DirectoryPath);
+
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.InitializeAsync());
+        Assert.True(Directory.Exists(database.DirectoryPath));
+        Assert.False(File.Exists(database.DatabasePath));
     }
 
     private static DomainTask CreateTask(
@@ -296,16 +533,41 @@ public sealed class SqliteTaskRepositoryTests
         }
 
         public string DatabasePath { get; }
+        public string DirectoryPath => _directoryPath;
 
-        public static async System.Threading.Tasks.Task<TestDatabase> CreateAsync()
-        {
-            var database = new TestDatabase();
-            await database.CreateRepository().InitializeAsync();
-            await database.CreateRepository().InitializeAsync();
-            return database;
-        }
+        public static System.Threading.Tasks.Task<TestDatabase> CreateAsync() =>
+            System.Threading.Tasks.Task.FromResult(new TestDatabase());
 
         public SqliteTaskRepository CreateRepository() => new(DatabasePath);
+
+        public async System.Threading.Tasks.Task<SqliteTaskRepository> CreateInitializedRepositoryAsync()
+        {
+            var repository = CreateRepository();
+            await repository.InitializeAsync();
+            return repository;
+        }
+
+        public async System.Threading.Tasks.Task MarkAsLegacyVersionOneAsync() =>
+            await ExecuteSqlAsync("""
+                DROP TABLE PersistenceSchemaVersion;
+                PRAGMA user_version = 1;
+                """);
+
+        public async System.Threading.Tasks.Task<T> ExecuteScalarAsync<T>(string sql)
+        {
+            var connectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = DatabasePath,
+                ForeignKeys = true,
+                Pooling = false
+            }.ToString();
+            await using var connection = new SqliteConnection(connectionString);
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            var value = await command.ExecuteScalarAsync();
+            return (T)Convert.ChangeType(value!, typeof(T), System.Globalization.CultureInfo.InvariantCulture);
+        }
 
         public async System.Threading.Tasks.Task ExecuteSqlAsync(
             string sql,
