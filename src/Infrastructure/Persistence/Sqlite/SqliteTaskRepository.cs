@@ -334,20 +334,18 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
                         $"Operation '{operation.OperationId.Value}' was previously applied without matching state-transition history.");
                 }
 
-                if (attempt is not null)
-                {
-                    var existingSnapshotNumber = await FindAttemptSnapshotAsync(
+                var existingSnapshotNumber = attempt is null
+                    ? null
+                    : await FindAttemptSnapshotAsync(
                         connection,
                         transaction,
                         attempt,
                         cancellationToken);
-                    if (existingSnapshotNumber is null
-                        || persistedTransition.AssociatedAttemptId != attempt.Id
-                        || persistedTransition.AssociatedAttemptSnapshotNumber != existingSnapshotNumber)
-                    {
-                        throw new TaskPersistenceException(
-                            $"Operation '{operation.OperationId.Value}' was replayed with a different associated attempt snapshot.");
-                    }
+                if (persistedTransition.AssociatedAttemptId != attempt?.Id
+                    || persistedTransition.AssociatedAttemptSnapshotNumber != existingSnapshotNumber)
+                {
+                    throw new TaskPersistenceException(
+                        $"Operation '{operation.OperationId.Value}' was replayed with a different associated attempt snapshot.");
                 }
 
                 await transaction.CommitAsync(cancellationToken);

@@ -178,6 +178,32 @@ public sealed class SqliteTaskRepositoryTests
     }
 
     [Fact]
+    public async System.Threading.Tasks.Task Concurrent_duplicate_attempt_snapshots_are_idempotent()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var initializer = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await initializer.AddAsync(task);
+        var attempt = new TaskAttempt(
+            new AttemptId("attempt-concurrent-duplicate"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+        var repositoryA = await database.CreateInitializedRepositoryAsync();
+        var repositoryB = await database.CreateInitializedRepositoryAsync();
+
+        await System.Threading.Tasks.Task.WhenAll(
+            repositoryA.AppendAttemptAsync(attempt),
+            repositoryB.AppendAttemptAsync(attempt));
+
+        Assert.Equal([attempt], await (await database.CreateInitializedRepositoryAsync())
+            .GetAttemptsAsync(task.Id));
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM TaskAttemptSnapshots;"));
+    }
+
+    [Fact]
     public async System.Threading.Tasks.Task Evidence_is_append_only_ordered_and_survives_repository_restart()
     {
         await using var database = await TestDatabase.CreateAsync();
@@ -467,14 +493,19 @@ public sealed class SqliteTaskRepositoryTests
             1,
             TaskAttemptState.Created,
             CreatedAt.AddMinutes(1));
+        var evidence = CreateEvidence("evidence-restart", task.Id, attempt.Id);
 
         var result = await repository.ApplyTransitionWithHistoryAsync(operation, transition, attempt);
+        await repository.AddEvidenceAsync(evidence);
         await repository.DisposeAsync();
         var restartedRepository = await database.CreateInitializedRepositoryAsync();
         var restoredTask = await restartedRepository.GetByIdAsync(task.Id);
         var transitions = await restartedRepository.GetStateTransitionsAsync(task.Id);
         var attempts = await restartedRepository.GetAttemptsAsync(task.Id);
+        var restoredEvidence = await restartedRepository.GetEvidenceAsync(task.Id);
         var replay = await restartedRepository.ApplyTransitionWithHistoryAsync(operation, transition, attempt);
+        var replayWithoutAttempt = await CaptureAsync(
+            () => restartedRepository.ApplyTransitionWithHistoryAsync(operation, transition));
 
         Assert.Equal(TaskOperationStatus.Applied, result.Status);
         Assert.NotNull(restoredTask);
@@ -492,7 +523,9 @@ public sealed class SqliteTaskRepositoryTests
                 Assert.Equal(1, record.AssociatedAttemptSnapshotNumber);
             });
         Assert.Equal([attempt], attempts);
+        Assert.Equal([evidence], restoredEvidence);
         Assert.Equal(TaskOperationStatus.AlreadyApplied, replay.Status);
+        Assert.IsType<TaskPersistenceException>(replayWithoutAttempt);
         Assert.Equal(1, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM StateTransitions;"));
         Assert.Equal(1, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM TaskAttemptSnapshots;"));
         await Assert.ThrowsAsync<SqliteException>(() => database.ExecuteSqlAsync(
@@ -544,6 +577,19 @@ public sealed class SqliteTaskRepositoryTests
         Assert.Empty(persistedTask.AppliedOperations);
         Assert.Empty(await repository.GetAttemptsAsync(task.Id));
         Assert.Empty(await repository.GetStateTransitionsAsync(task.Id));
+
+        await database.ExecuteSqlAsync("DROP TRIGGER FailStateTransitionInsert;");
+        var retry = await repository.ApplyTransitionWithHistoryAsync(operation, transition, attempt);
+        var retriedTask = await repository.GetByIdAsync(task.Id);
+
+        Assert.Equal(TaskOperationStatus.Applied, retry.Status);
+        Assert.NotNull(retriedTask);
+        Assert.Equal(TaskState.Ready, retriedTask.State);
+        Assert.Equal(new TaskRevision(1), retriedTask.Revision);
+        Assert.Equal([attempt], await repository.GetAttemptsAsync(task.Id));
+        Assert.Collection(
+            await repository.GetStateTransitionsAsync(task.Id),
+            record => Assert.Equal(transition, record.Transition));
     }
 
     [Fact]
