@@ -97,9 +97,9 @@ public sealed class PolicyEvaluatorTests
     {
         var evaluator = new PolicyEvaluator();
         var action = new PolicyAction("read");
-        var context = new PolicyContext(
+        var context = PolicyContext.FromRegistrations(
             PolicyContextStatus.Complete,
-            [new PolicyCapability("workspace.read")]);
+            [TrustedRegistration("workspace.read")]);
 
         var first = evaluator.Evaluate(action, context);
         var second = evaluator.Evaluate(action, context);
@@ -115,9 +115,9 @@ public sealed class PolicyEvaluatorTests
     {
         var decision = new PolicyEvaluator().Evaluate(
             new PolicyAction(action),
-            new PolicyContext(
+            PolicyContext.FromRegistrations(
                 PolicyContextStatus.Complete,
-                [new PolicyCapability(capability)]));
+                [TrustedRegistration(capability)]));
 
         Assert.Equal(PolicyDecisionOutcome.Allow, decision.Outcome);
         Assert.Equal("capability.granted", decision.Reason.Code);
@@ -128,9 +128,9 @@ public sealed class PolicyEvaluatorTests
     {
         var decision = new PolicyEvaluator().Evaluate(
             new PolicyAction("READ"),
-            new PolicyContext(
+            PolicyContext.FromRegistrations(
                 PolicyContextStatus.Complete,
-                [new PolicyCapability(" WORKSPACE.READ ")]));
+                [TrustedRegistration(" WORKSPACE.READ ")]));
 
         Assert.Equal(PolicyDecisionOutcome.Allow, decision.Outcome);
     }
@@ -192,9 +192,9 @@ public sealed class PolicyEvaluatorTests
         PolicyDecisionOutcome secondOutcome,
         PolicyDecisionOutcome expectedOutcome)
     {
-        var context = new PolicyContext(
+        var context = PolicyContext.FromRegistrations(
             PolicyContextStatus.Complete,
-            [new PolicyCapability("workspace.read")],
+            [TrustedRegistration("workspace.read")],
             [
                 new PolicyRule(new PolicyAction("read"), DecisionFor(firstOutcome, "first")),
                 new PolicyRule(new PolicyAction("READ"), DecisionFor(secondOutcome, "second"))
@@ -238,6 +238,142 @@ public sealed class PolicyEvaluatorTests
 
         Assert.Single(context.Capabilities);
         Assert.Equal("workspace.read", context.Capabilities[0].Value);
+    }
+
+    [Theory]
+    [InlineData(PolicyCapabilitySource.System, PolicyCapabilityTrust.Trusted)]
+    [InlineData(PolicyCapabilitySource.Application, PolicyCapabilityTrust.Untrusted)]
+    [InlineData(PolicyCapabilitySource.Unknown, PolicyCapabilityTrust.Unknown)]
+    public void Represents_valid_capability_provenance(
+        PolicyCapabilitySource source,
+        PolicyCapabilityTrust trust)
+    {
+        var provenance = new PolicyCapabilityProvenance(source, trust);
+
+        Assert.Equal(source, provenance.Source);
+        Assert.Equal(trust, provenance.Trust);
+    }
+
+    [Fact]
+    public void Rejects_undefined_or_inconsistent_capability_provenance()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new PolicyCapabilityProvenance((PolicyCapabilitySource)int.MaxValue, PolicyCapabilityTrust.Trusted));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new PolicyCapabilityProvenance(PolicyCapabilitySource.System, (PolicyCapabilityTrust)int.MaxValue));
+        Assert.Throws<ArgumentException>(() =>
+            new PolicyCapabilityProvenance(PolicyCapabilitySource.Unknown, PolicyCapabilityTrust.Trusted));
+    }
+
+    [Theory]
+    [InlineData(PolicyCapabilityTrust.Unknown, "capability.provenance.unknown")]
+    [InlineData(PolicyCapabilityTrust.Untrusted, "capability.provenance.untrusted")]
+    public void Escalates_when_a_capability_registration_is_not_trusted(
+        PolicyCapabilityTrust trust,
+        string expectedReason)
+    {
+        var registration = new PolicyCapabilityRegistration(
+            new PolicyCapability("workspace.read"),
+            new PolicyCapabilityProvenance(PolicyCapabilitySource.Agent, trust));
+        var context = PolicyContext.FromRegistrations(PolicyContextStatus.Complete, [registration]);
+
+        var decision = new PolicyEvaluator().Evaluate(new PolicyAction("read"), context);
+
+        Assert.Equal(PolicyDecisionOutcome.Escalate, decision.Outcome);
+        Assert.Equal(expectedReason, decision.Reason.Code);
+    }
+
+    [Fact]
+    public void Treats_legacy_capability_values_as_unknown_provenance()
+    {
+        var context = new PolicyContext(
+            PolicyContextStatus.Complete,
+            [new PolicyCapability("workspace.read")]);
+
+        var decision = new PolicyEvaluator().Evaluate(new PolicyAction("read"), context);
+
+        Assert.Equal(PolicyDecisionOutcome.Escalate, decision.Outcome);
+        Assert.Equal("capability.provenance.unknown", decision.Reason.Code);
+    }
+
+    [Fact]
+    public void Deduplicates_identical_registrations_and_rejects_conflicting_provenance()
+    {
+        var registration = TrustedRegistration("workspace.read");
+        var context = PolicyContext.FromRegistrations(
+            PolicyContextStatus.Complete,
+            [registration, registration]);
+
+        Assert.Single(context.Registrations);
+        Assert.Throws<ArgumentException>(() =>
+            PolicyContext.FromRegistrations(
+                PolicyContextStatus.Complete,
+                [
+                    registration,
+                    new PolicyCapabilityRegistration(
+                        new PolicyCapability("workspace.read"),
+                        new PolicyCapabilityProvenance(PolicyCapabilitySource.Tool, PolicyCapabilityTrust.Trusted))
+                ]));
+    }
+
+    [Fact]
+    public void Registered_context_copies_and_exposes_read_only_registrations()
+    {
+        var registrations = new List<PolicyCapabilityRegistration>
+        {
+            TrustedRegistration("workspace.read")
+        };
+        var context = PolicyContext.FromRegistrations(PolicyContextStatus.Complete, registrations);
+
+        registrations.Clear();
+
+        Assert.Single(context.Registrations);
+        Assert.Throws<NotSupportedException>(() =>
+            ((IList<PolicyCapabilityRegistration>)context.Registrations).Clear());
+    }
+
+    [Fact]
+    public void Explicit_deny_overrides_trusted_or_unknown_provenance()
+    {
+        var denial = PolicyDecision.Deny(new PolicyReason(
+            "policy.explicit-denial",
+            "The action is explicitly prohibited."));
+        var rule = new PolicyRule(new PolicyAction("read"), denial);
+        var contexts = new[]
+        {
+            PolicyContext.FromRegistrations(
+                PolicyContextStatus.Complete,
+                [TrustedRegistration("workspace.read")],
+                [rule]),
+            PolicyContext.FromRegistrations(
+                PolicyContextStatus.Complete,
+                [
+                    new PolicyCapabilityRegistration(
+                        new PolicyCapability("workspace.read"),
+                        PolicyCapabilityProvenance.Unknown)
+                ],
+                [rule])
+        };
+
+        foreach (var context in contexts)
+        {
+            var decision = new PolicyEvaluator().Evaluate(new PolicyAction("read"), context);
+            Assert.Equal(PolicyDecisionOutcome.Deny, decision.Outcome);
+            Assert.Equal("policy.explicit-denial", decision.Reason.Code);
+        }
+    }
+
+    [Fact]
+    public void Rejects_missing_registration_inputs()
+    {
+        Assert.Throws<ArgumentNullException>(() =>
+            new PolicyCapabilityRegistration(null!, PolicyCapabilityProvenance.Unknown));
+        Assert.Throws<ArgumentNullException>(() =>
+            new PolicyCapabilityRegistration(new PolicyCapability("workspace.read"), null!));
+        Assert.Throws<ArgumentNullException>(() =>
+            PolicyContext.FromRegistrations(PolicyContextStatus.Complete, null!));
+        Assert.Throws<ArgumentException>(() =>
+            PolicyContext.FromRegistrations(PolicyContextStatus.Complete, [null!]));
     }
 
     [Theory]
@@ -286,4 +422,9 @@ public sealed class PolicyEvaluatorTests
             _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, null)
         };
     }
+
+    private static PolicyCapabilityRegistration TrustedRegistration(string capability) =>
+        new(
+            new PolicyCapability(capability),
+            new PolicyCapabilityProvenance(PolicyCapabilitySource.System, PolicyCapabilityTrust.Trusted));
 }

@@ -44,16 +44,27 @@ public sealed class PolicyEvaluator : IPolicyEvaluator
                 "Policy evaluation cannot continue because the action is unsupported.");
         }
 
-        if (!context.Capabilities.Contains(requiredCapability))
+        var registration = context.Registrations.FirstOrDefault(
+            candidate => candidate.Capability == requiredCapability);
+        if (registration is null)
         {
             return Escalate(
                 "capability.missing",
                 "Policy evaluation cannot establish permission because the required capability is not present.");
         }
 
+        if (registration.Provenance.Trust != PolicyCapabilityTrust.Trusted)
+        {
+            return Escalate(
+                registration.Provenance.Trust == PolicyCapabilityTrust.Unknown
+                    ? "capability.provenance.unknown"
+                    : "capability.provenance.untrusted",
+                "Policy evaluation cannot establish permission because the required capability provenance is not trusted.");
+        }
+
         return PolicyDecision.Allow(new PolicyReason(
             "capability.granted",
-            "The context contains the capability required for this action."));
+            "The context contains a trusted registration for the capability required for this action."));
     }
 
     private static PolicyCapability? GetRequiredCapability(PolicyAction action)
