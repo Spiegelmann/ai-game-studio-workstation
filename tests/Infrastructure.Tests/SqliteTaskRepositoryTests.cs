@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using AiGameStudioWorkstation.Application.Tasks.Persistence;
+using AiGameStudioWorkstation.Core.Domain.Execution;
 using AiGameStudioWorkstation.Core.Domain.Tasks;
 using AiGameStudioWorkstation.Infrastructure.Persistence.Sqlite;
 using Microsoft.Data.Sqlite;
@@ -85,6 +86,265 @@ public sealed class SqliteTaskRepositoryTests
         Assert.Equal(TaskOperationStatus.Rejected, conflictingReplay.Status);
         Assert.Equal(TaskOperationRejection.OperationIdConflict, conflictingReplay.Rejection);
         Assert.Equal(new TaskRevision(1), conflictingReplay.Task.Revision);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Attempt_snapshots_are_append_only_and_survive_repository_restart()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var task = CreateTask();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
+
+        var attemptOne = new TaskAttempt(
+            new AttemptId("attempt-one"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+        var running = attemptOne.TransitionTo(TaskAttemptState.Running);
+        var failed = running.TransitionTo(TaskAttemptState.Failed, CreatedAt.AddMinutes(4));
+        var attemptTwo = new TaskAttempt(
+            new AttemptId("attempt-two"),
+            task.Id,
+            2,
+            TaskAttemptState.Completed,
+            CreatedAt.AddMinutes(5),
+            CreatedAt.AddMinutes(8));
+
+        await repository.AppendAttemptAsync(attemptOne);
+        await repository.AppendAttemptAsync(running);
+        await repository.AppendAttemptAsync(failed);
+        await repository.AppendAttemptAsync(attemptTwo);
+        await repository.AppendAttemptAsync(failed);
+
+        var restartedRepository = await database.CreateInitializedRepositoryAsync();
+        var snapshots = await restartedRepository.GetAttemptsAsync(task.Id);
+
+        Assert.Equal([attemptOne, running, failed, attemptTwo], snapshots);
+        Assert.Equal(4, await database.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM TaskAttemptSnapshots;"));
+        await Assert.ThrowsAsync<SqliteException>(() => database.ExecuteSqlAsync(
+            "UPDATE TaskAttemptSnapshots SET State = $state WHERE AttemptId = $attemptId AND SnapshotNumber = 1;",
+            ("$state", (int)TaskAttemptState.Failed),
+            ("$attemptId", attemptOne.Id.Value)));
+        await Assert.ThrowsAsync<SqliteException>(() => database.ExecuteSqlAsync(
+            "DELETE FROM TaskAttemptSnapshots WHERE AttemptId = $attempt-one AND SnapshotNumber = 1;",
+            ("$attempt-one", attemptOne.Id.Value)));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Attempts_reject_missing_tasks_and_conflicting_or_invalid_snapshots()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var missingTaskAttempt = new TaskAttempt(
+            new AttemptId("attempt-missing-task"),
+            new TaskId("missing-task"),
+            1,
+            TaskAttemptState.Created,
+            CreatedAt);
+
+        await Assert.ThrowsAsync<TaskNotFoundException>(() => repository.AppendAttemptAsync(missingTaskAttempt));
+
+        var task = CreateTask();
+        await repository.AddAsync(task);
+        var created = new TaskAttempt(
+            new AttemptId("attempt-conflict"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+        await repository.AppendAttemptAsync(created);
+
+        var reusedAttemptId = new TaskAttempt(
+            created.Id,
+            task.Id,
+            2,
+            TaskAttemptState.Created,
+            created.StartedAt);
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AppendAttemptAsync(reusedAttemptId));
+
+        var completed = created.TransitionTo(TaskAttemptState.Completed, CreatedAt.AddMinutes(2));
+        await repository.AppendAttemptAsync(completed);
+        var resumed = new TaskAttempt(
+            completed.Id,
+            completed.TaskId,
+            completed.Number,
+            TaskAttemptState.Running,
+            completed.StartedAt);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => repository.AppendAttemptAsync(resumed));
+        Assert.Equal([created, completed], await repository.GetAttemptsAsync(task.Id));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Concurrent_attempt_creation_preserves_unique_task_attempt_numbers()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var task = CreateTask();
+        var initializer = await database.CreateInitializedRepositoryAsync();
+        await initializer.AddAsync(task);
+        var repositoryA = await database.CreateInitializedRepositoryAsync();
+        var repositoryB = await database.CreateInitializedRepositoryAsync();
+        var attemptA = new TaskAttempt(
+            new AttemptId("concurrent-attempt-a"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+        var attemptB = new TaskAttempt(
+            new AttemptId("concurrent-attempt-b"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(2));
+
+        var outcomes = await System.Threading.Tasks.Task.WhenAll(
+            CaptureAsync(() => repositoryA.AppendAttemptAsync(attemptA)),
+            CaptureAsync(() => repositoryB.AppendAttemptAsync(attemptB)));
+
+        Assert.Single(outcomes, exception => exception is null);
+        Assert.Single(outcomes, exception =>
+            exception is InvalidOperationException or TaskPersistenceException);
+        Assert.Single(await (await database.CreateInitializedRepositoryAsync()).GetAttemptsAsync(task.Id));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Task_transition_and_attempt_are_atomic_and_reconstructable_after_restart()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var task = CreateTask();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
+        var operation = CreateOperation(task, "operation-with-history", TaskState.Ready);
+        var transition = CreateStateTransition(
+            task.Id,
+            "transition-ready",
+            TaskState.Proposed,
+            TaskState.Ready,
+            CreatedAt.AddMinutes(1),
+            "Task is ready.");
+        var attempt = new TaskAttempt(
+            new AttemptId("attempt-with-transition"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+
+        var result = await repository.ApplyTransitionWithHistoryAsync(operation, transition, attempt);
+        await repository.DisposeAsync();
+        var restartedRepository = await database.CreateInitializedRepositoryAsync();
+        var restoredTask = await restartedRepository.GetByIdAsync(task.Id);
+        var transitions = await restartedRepository.GetStateTransitionsAsync(task.Id);
+        var attempts = await restartedRepository.GetAttemptsAsync(task.Id);
+        var replay = await restartedRepository.ApplyTransitionWithHistoryAsync(operation, transition, attempt);
+
+        Assert.Equal(TaskOperationStatus.Applied, result.Status);
+        Assert.NotNull(restoredTask);
+        Assert.Equal(TaskState.Ready, restoredTask.State);
+        Assert.Equal(new TaskRevision(1), restoredTask.Revision);
+        Assert.Collection(
+            transitions,
+            record =>
+            {
+                Assert.Equal(transition, record.Transition);
+                Assert.Equal(operation.OperationId, record.OperationId);
+                Assert.Equal(new TaskRevision(0), record.ExpectedRevision);
+                Assert.Equal(new TaskRevision(1), record.ResultingRevision);
+                Assert.Equal(attempt.Id, record.AssociatedAttemptId);
+                Assert.Equal(1, record.AssociatedAttemptSnapshotNumber);
+            });
+        Assert.Equal([attempt], attempts);
+        Assert.Equal(TaskOperationStatus.AlreadyApplied, replay.Status);
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM StateTransitions;"));
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM TaskAttemptSnapshots;"));
+        await Assert.ThrowsAsync<SqliteException>(() => database.ExecuteSqlAsync(
+            "UPDATE StateTransitions SET Reason = 'rewritten' WHERE TaskId = $taskId AND TransitionId = $transitionId;",
+            ("$taskId", task.Id.Value),
+            ("$transitionId", transition.Id.Value)));
+        await Assert.ThrowsAsync<SqliteException>(() => database.ExecuteSqlAsync(
+            "DELETE FROM StateTransitions WHERE TaskId = $taskId AND TransitionId = $transitionId;",
+            ("$taskId", task.Id.Value),
+            ("$transitionId", transition.Id.Value)));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Failed_state_transition_insert_rolls_back_task_operation_and_attempt()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var task = CreateTask();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        await repository.AddAsync(task);
+        await database.ExecuteSqlAsync("""
+            CREATE TRIGGER FailStateTransitionInsert
+            BEFORE INSERT ON StateTransitions
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated state-transition write failure');
+            END;
+            """);
+        var operation = CreateOperation(task, "operation-history-rollback", TaskState.Ready);
+        var transition = CreateStateTransition(
+            task.Id,
+            "transition-rollback",
+            TaskState.Proposed,
+            TaskState.Ready,
+            CreatedAt.AddMinutes(1),
+            "Task is ready.");
+        var attempt = new TaskAttempt(
+            new AttemptId("attempt-rollback"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
+
+        await Assert.ThrowsAsync<TaskPersistenceException>(() =>
+            repository.ApplyTransitionWithHistoryAsync(operation, transition, attempt));
+
+        var persistedTask = await repository.GetByIdAsync(task.Id);
+        Assert.NotNull(persistedTask);
+        Assert.Equal(TaskState.Proposed, persistedTask.State);
+        Assert.Equal(new TaskRevision(0), persistedTask.Revision);
+        Assert.Empty(persistedTask.AppliedOperations);
+        Assert.Empty(await repository.GetAttemptsAsync(task.Id));
+        Assert.Empty(await repository.GetStateTransitionsAsync(task.Id));
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Concurrent_task_transitions_preserve_history_and_reject_stale_revision()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var task = CreateTask();
+        var initializer = await database.CreateInitializedRepositoryAsync();
+        await initializer.AddAsync(task);
+        var repositoryA = await database.CreateInitializedRepositoryAsync();
+        var repositoryB = await database.CreateInitializedRepositoryAsync();
+        var operationA = CreateOperation(task, "operation-race-ready", TaskState.Ready);
+        var operationB = CreateOperation(task, "operation-race-cancel", TaskState.Cancelled);
+        var transitionA = CreateStateTransition(
+            task.Id,
+            "transition-race-ready",
+            TaskState.Proposed,
+            TaskState.Ready,
+            CreatedAt.AddMinutes(1),
+            "Task is ready.");
+        var transitionB = CreateStateTransition(
+            task.Id,
+            "transition-race-cancel",
+            TaskState.Proposed,
+            TaskState.Cancelled,
+            CreatedAt.AddMinutes(2),
+            "Task was cancelled.");
+
+        var results = await System.Threading.Tasks.Task.WhenAll(
+            repositoryA.ApplyTransitionWithHistoryAsync(operationA, transitionA),
+            repositoryB.ApplyTransitionWithHistoryAsync(operationB, transitionB));
+
+        Assert.Single(results, result => result.Status == TaskOperationStatus.Applied);
+        Assert.Single(results, result =>
+            result.Status == TaskOperationStatus.Rejected
+            && result.Rejection == TaskOperationRejection.StaleRevision);
+        Assert.Single(await (await database.CreateInitializedRepositoryAsync())
+            .GetStateTransitionsAsync(task.Id));
     }
 
     [Fact]
@@ -275,11 +535,29 @@ public sealed class SqliteTaskRepositoryTests
         var repository = database.CreateRepository();
         var task = CreateTask();
         var operation = CreateOperation(task, "operation-before-init", TaskState.Ready);
+        var transition = CreateStateTransition(
+            task.Id,
+            "transition-before-init",
+            TaskState.Proposed,
+            TaskState.Ready,
+            CreatedAt.AddMinutes(1),
+            "Task is ready.");
+        var attempt = new TaskAttempt(
+            new AttemptId("attempt-before-init"),
+            task.Id,
+            1,
+            TaskAttemptState.Created,
+            CreatedAt.AddMinutes(1));
 
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetByIdAsync(task.Id));
         await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AddAsync(task));
         await Assert.ThrowsAsync<TaskPersistenceException>(() =>
             repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1)));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.AppendAttemptAsync(attempt));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetAttemptsAsync(task.Id));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() => repository.GetStateTransitionsAsync(task.Id));
+        await Assert.ThrowsAsync<TaskPersistenceException>(() =>
+            repository.ApplyTransitionWithHistoryAsync(operation, transition, attempt));
 
         await repository.InitializeAsync();
         await repository.AddAsync(task);
@@ -289,6 +567,11 @@ public sealed class SqliteTaskRepositoryTests
         await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.AddAsync(CreateTask()));
         await Assert.ThrowsAsync<ObjectDisposedException>(() =>
             repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1)));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.AppendAttemptAsync(attempt));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.GetAttemptsAsync(task.Id));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.GetStateTransitionsAsync(task.Id));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() =>
+            repository.ApplyTransitionWithHistoryAsync(operation, transition, attempt));
         await Assert.ThrowsAsync<ObjectDisposedException>(() => repository.InitializeAsync());
     }
 
@@ -313,7 +596,7 @@ public sealed class SqliteTaskRepositoryTests
         Assert.Single(restored.AppliedOperations);
         Assert.Equal(appliedAt, await database.ExecuteScalarAsync<string>(
             "SELECT AppliedAt FROM PersistenceSchemaVersion WHERE Id = 1;"));
-        Assert.Equal(2, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
+        Assert.Equal(3, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
     }
 
     [Fact]
@@ -335,7 +618,7 @@ public sealed class SqliteTaskRepositoryTests
         Assert.Equal(TaskState.Ready, restored.State);
         Assert.Equal(new TaskRevision(1), restored.Revision);
         Assert.Equal([operation], restored.AppliedOperations);
-        Assert.Equal(2, await database.ExecuteScalarAsync<int>(
+        Assert.Equal(3, await database.ExecuteScalarAsync<int>(
             "SELECT Version FROM PersistenceSchemaVersion WHERE Id = 1;"));
     }
 
@@ -373,6 +656,43 @@ public sealed class SqliteTaskRepositoryTests
         var restored = await recoveredRepository.GetByIdAsync(task.Id);
         Assert.NotNull(restored);
         Assert.Equal([operation], restored.AppliedOperations);
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Failed_attempt_history_migration_rolls_back_without_changing_v2_data()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        var repository = await database.CreateInitializedRepositoryAsync();
+        var task = CreateTask();
+        await repository.AddAsync(task);
+        var operation = CreateOperation(task, "operation-v2-migration", TaskState.Ready);
+        await repository.ApplyTransitionAsync(operation, CreatedAt.AddMinutes(1));
+        await repository.DisposeAsync();
+        await database.MarkAsLegacyVersionTwoAsync();
+
+        var failingRepository = new SqliteTaskRepository(
+            database.DatabasePath,
+            (fromVersion, toVersion) =>
+            {
+                if (fromVersion == 2 && toVersion == 3)
+                {
+                    throw new InvalidOperationException("Simulated attempt-history migration failure.");
+                }
+            });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => failingRepository.InitializeAsync());
+        Assert.Equal(2, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
+        Assert.Equal(2, await database.ExecuteScalarAsync<int>(
+            "SELECT Version FROM PersistenceSchemaVersion WHERE Id = 1;"));
+        Assert.Equal(0, await database.ExecuteScalarAsync<int>(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'TaskAttempts';"));
+        Assert.Equal(1, await database.ExecuteScalarAsync<int>("SELECT COUNT(*) FROM TaskOperations;"));
+
+        var recoveredRepository = await database.CreateInitializedRepositoryAsync();
+        var restoredTask = await recoveredRepository.GetByIdAsync(task.Id);
+        Assert.NotNull(restoredTask);
+        Assert.Equal([operation], restoredTask.AppliedOperations);
+        Assert.Equal(3, await database.ExecuteScalarAsync<int>("PRAGMA user_version;"));
     }
 
     [Fact]
@@ -423,7 +743,7 @@ public sealed class SqliteTaskRepositoryTests
 
         await System.Threading.Tasks.Task.WhenAll(
             Enumerable.Range(0, 8).Select(_ => repository.InitializeAsync()));
-        Assert.Equal([(0, 1), (1, 2)], migrationOrder.ToArray());
+        Assert.Equal([(0, 1), (1, 2), (2, 3)], migrationOrder.ToArray());
 
         var secondDatabase = await TestDatabase.CreateAsync();
         await using (secondDatabase)
@@ -442,7 +762,7 @@ public sealed class SqliteTaskRepositoryTests
                 repositoryA.InitializeAsync(),
                 repositoryB.InitializeAsync());
 
-            Assert.Equal([(0, 1), (1, 2)], multipleInstanceMigrationOrder.ToArray());
+            Assert.Equal([(0, 1), (1, 2), (2, 3)], multipleInstanceMigrationOrder.ToArray());
             var task = CreateTask();
             await repositoryA.AddAsync(task);
             var sharedTask = await repositoryB.GetByIdAsync(task.Id);
@@ -518,6 +838,29 @@ public sealed class SqliteTaskRepositoryTests
         TaskState targetState) =>
         new(task.Id, new OperationId(operationId), task.Revision, targetState);
 
+    private static StateTransition CreateStateTransition(
+        TaskId taskId,
+        string transitionId,
+        TaskState previousState,
+        TaskState nextState,
+        DateTimeOffset timestamp,
+        string reason) =>
+        new(new TransitionId(transitionId), taskId, previousState, nextState, timestamp, reason);
+
+    private static async System.Threading.Tasks.Task<Exception?> CaptureAsync(
+        Func<System.Threading.Tasks.Task> operation)
+    {
+        try
+        {
+            await operation();
+            return null;
+        }
+        catch (Exception exception)
+        {
+            return exception;
+        }
+    }
+
     private sealed class TestDatabase : IAsyncDisposable
     {
         private readonly string _directoryPath;
@@ -549,8 +892,20 @@ public sealed class SqliteTaskRepositoryTests
 
         public async System.Threading.Tasks.Task MarkAsLegacyVersionOneAsync() =>
             await ExecuteSqlAsync("""
+                DROP TABLE StateTransitions;
+                DROP TABLE TaskAttemptSnapshots;
+                DROP TABLE TaskAttempts;
                 DROP TABLE PersistenceSchemaVersion;
                 PRAGMA user_version = 1;
+                """);
+
+        public async System.Threading.Tasks.Task MarkAsLegacyVersionTwoAsync() =>
+            await ExecuteSqlAsync("""
+                DROP TABLE StateTransitions;
+                DROP TABLE TaskAttemptSnapshots;
+                DROP TABLE TaskAttempts;
+                UPDATE PersistenceSchemaVersion SET Version = 2 WHERE Id = 1;
+                PRAGMA user_version = 2;
                 """);
 
         public async System.Threading.Tasks.Task<T> ExecuteScalarAsync<T>(string sql)

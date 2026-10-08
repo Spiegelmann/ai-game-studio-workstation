@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.Json;
 using AiGameStudioWorkstation.Application.Tasks.Persistence;
+using AiGameStudioWorkstation.Core.Domain.Execution;
 using AiGameStudioWorkstation.Core.Domain.Tasks;
 using Microsoft.Data.Sqlite;
 using AsyncTask = System.Threading.Tasks.Task;
@@ -11,14 +12,16 @@ namespace AiGameStudioWorkstation.Infrastructure.Persistence.Sqlite;
 public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncDisposable
 {
     private const int InitialSchemaVersion = 1;
-    private const int SchemaVersion = 2;
+    private const int SchemaVersionTwo = 2;
+    private const int SchemaVersion = 3;
     private const string SchemaVersionTable = "PersistenceSchemaVersion";
     private const int MaximumTaskStateValue = (int)TaskState.HumanReviewRequired;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly SchemaMigration[] Migrations =
     [
         new(0, 1, MigrateVersionZeroToOneAsync),
-        new(1, 2, ApplySchemaVersionTwoAsync)
+        new(1, 2, ApplySchemaVersionTwoAsync),
+        new(2, 3, ApplySchemaVersionThreeAsync)
     ];
     private readonly string _connectionString;
     private readonly string _databasePath;
@@ -271,6 +274,213 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
         }
     }
 
+    public async System.Threading.Tasks.Task<TaskOperationResult> ApplyTransitionWithHistoryAsync(
+        TaskTransitionOperation operation,
+        StateTransition transition,
+        TaskAttempt? attempt = null,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureReady();
+        ArgumentNullException.ThrowIfNull(operation);
+        ArgumentNullException.ThrowIfNull(transition);
+
+        if (transition.TaskId != operation.TaskId)
+        {
+            throw new ArgumentException(
+                "The state transition must belong to the task being updated.",
+                nameof(transition));
+        }
+
+        if (transition.NextState != operation.TargetState)
+        {
+            throw new ArgumentException(
+                "The state transition target must match the task operation target.",
+                nameof(transition));
+        }
+
+        if (attempt is not null && attempt.TaskId != operation.TaskId)
+        {
+            throw new ArgumentException(
+                "An associated attempt must belong to the task being updated.",
+                nameof(attempt));
+        }
+
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            using var transaction = connection.BeginTransaction(deferred: false);
+            var task = await LoadTaskAsync(connection, transaction, operation.TaskId, cancellationToken);
+            if (task is null)
+            {
+                throw new TaskNotFoundException(operation.TaskId.Value);
+            }
+
+            var result = task.ApplyTransition(operation, transition.Timestamp);
+            if (result.Status == TaskOperationStatus.AlreadyApplied)
+            {
+                var persistedTransition = await LoadStateTransitionForOperationAsync(
+                    connection,
+                    transaction,
+                    operation.TaskId,
+                    operation.OperationId,
+                    cancellationToken);
+                if (persistedTransition is null
+                    || persistedTransition.Transition != transition
+                    || persistedTransition.ExpectedRevision != operation.ExpectedRevision)
+                {
+                    throw new TaskPersistenceException(
+                        $"Operation '{operation.OperationId.Value}' was previously applied without matching state-transition history.");
+                }
+
+                if (attempt is not null)
+                {
+                    var existingSnapshotNumber = await FindAttemptSnapshotAsync(
+                        connection,
+                        transaction,
+                        attempt,
+                        cancellationToken);
+                    if (existingSnapshotNumber is null
+                        || persistedTransition.AssociatedAttemptId != attempt.Id
+                        || persistedTransition.AssociatedAttemptSnapshotNumber != existingSnapshotNumber)
+                    {
+                        throw new TaskPersistenceException(
+                            $"Operation '{operation.OperationId.Value}' was replayed with a different associated attempt snapshot.");
+                    }
+                }
+
+                await transaction.CommitAsync(cancellationToken);
+                return result;
+            }
+
+            if (result.Status == TaskOperationStatus.Rejected)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return result;
+            }
+
+            if (transition.PreviousState != task.State)
+            {
+                throw new ArgumentException(
+                    "The state transition previous state must match the persisted task state.",
+                    nameof(transition));
+            }
+
+            if (transition.Timestamp < task.CreatedAt || transition.Timestamp < task.UpdatedAt)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(transition),
+                    transition.Timestamp,
+                    "A persisted task update cannot precede its creation or previous update.");
+            }
+
+            await UpdateTaskAsync(connection, transaction, task, result.Task, cancellationToken);
+            await InsertOperationAsync(
+                connection,
+                transaction,
+                task,
+                operation,
+                result.Task,
+                transition.Timestamp,
+                cancellationToken);
+
+            var attemptSnapshotNumber = attempt is null
+                ? (int?)null
+                : await AppendAttemptSnapshotAsync(connection, transaction, attempt, cancellationToken);
+            await InsertStateTransitionAsync(
+                connection,
+                transaction,
+                operation,
+                transition,
+                result.Task.Revision,
+                attempt,
+                attemptSnapshotNumber,
+                cancellationToken);
+
+            await transaction.CommitAsync(cancellationToken);
+            return result;
+        }
+        catch (SqliteException exception)
+        {
+            throw new TaskPersistenceException(
+                $"Failed to apply operation '{operation.OperationId.Value}' with state-transition history to task '{operation.TaskId.Value}'.",
+                exception);
+        }
+    }
+
+    public async System.Threading.Tasks.Task AppendAttemptAsync(
+        TaskAttempt attempt,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureReady();
+        ArgumentNullException.ThrowIfNull(attempt);
+
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            using var transaction = connection.BeginTransaction(deferred: false);
+            await AppendAttemptSnapshotAsync(connection, transaction, attempt, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        catch (SqliteException exception)
+        {
+            throw new TaskPersistenceException(
+                $"Failed to append attempt '{attempt.Id.Value}' for task '{attempt.TaskId.Value}'.",
+                exception);
+        }
+    }
+
+    public async System.Threading.Tasks.Task<IReadOnlyList<TaskAttempt>> GetAttemptsAsync(
+        TaskId taskId,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureReady();
+        ArgumentNullException.ThrowIfNull(taskId);
+
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            using var transaction = connection.BeginTransaction(deferred: true);
+            var attempts = await LoadAttemptSnapshotsAsync(
+                connection,
+                transaction,
+                taskId,
+                cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return attempts;
+        }
+        catch (SqliteException exception)
+        {
+            throw new TaskPersistenceException($"Failed to load attempts for task '{taskId.Value}'.", exception);
+        }
+    }
+
+    public async System.Threading.Tasks.Task<IReadOnlyList<TaskStateTransitionRecord>> GetStateTransitionsAsync(
+        TaskId taskId,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureReady();
+        ArgumentNullException.ThrowIfNull(taskId);
+
+        try
+        {
+            await using var connection = await OpenConnectionAsync(cancellationToken);
+            using var transaction = connection.BeginTransaction(deferred: true);
+            var transitions = await LoadStateTransitionsAsync(
+                connection,
+                transaction,
+                taskId,
+                cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return transitions;
+        }
+        catch (SqliteException exception)
+        {
+            throw new TaskPersistenceException(
+                $"Failed to load state transitions for task '{taskId.Value}'.",
+                exception);
+        }
+    }
+
     public void Dispose()
     {
         _initializationLock.Wait();
@@ -455,6 +665,7 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
             transaction: null,
             requireVersionMetadata: true,
             cancellationToken);
+        await ValidateExecutionHistorySchemaAsync(connection, cancellationToken);
 
         await using (var integrityCommand = connection.CreateCommand())
         {
@@ -551,6 +762,132 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
             throw new TaskPersistenceException(
                 "The schema-version metadata is missing its singleton primary key.");
         }
+    }
+
+    private static async AsyncTask ValidateExecutionHistorySchemaAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var attemptColumns = await ReadTableColumnsAsync(
+            connection,
+            transaction: null,
+            "TaskAttempts",
+            cancellationToken);
+        RequireColumns("TaskAttempts", attemptColumns, ["AttemptId", "TaskId", "Number", "StartedAt"]);
+        if (!attemptColumns.Any(column =>
+                string.Equals(column.Name, "AttemptId", StringComparison.OrdinalIgnoreCase)
+                && column.PrimaryKeyPosition == 1))
+        {
+            throw new TaskPersistenceException("The TaskAttempts table is missing its AttemptId primary key.");
+        }
+
+        var attemptIndexes = await ReadUniqueIndexesAsync(
+            connection,
+            transaction: null,
+            "TaskAttempts",
+            cancellationToken);
+        if (!attemptIndexes.Any(index => index.Columns.SequenceEqual(
+                ["TaskId", "Number"],
+                StringComparer.OrdinalIgnoreCase))
+            || !attemptIndexes.Any(index => index.Columns.SequenceEqual(
+                ["TaskId", "AttemptId"],
+                StringComparer.OrdinalIgnoreCase)))
+        {
+            throw new TaskPersistenceException(
+                "The TaskAttempts table is missing its task-number or task-identity uniqueness constraint.");
+        }
+
+        var snapshotColumns = await ReadTableColumnsAsync(
+            connection,
+            transaction: null,
+            "TaskAttemptSnapshots",
+            cancellationToken);
+        RequireColumns(
+            "TaskAttemptSnapshots",
+            snapshotColumns,
+            ["AttemptId", "SnapshotNumber", "State", "CompletedAt"]);
+        if (!snapshotColumns.Any(column =>
+                string.Equals(column.Name, "AttemptId", StringComparison.OrdinalIgnoreCase)
+                && column.PrimaryKeyPosition == 1)
+            || !snapshotColumns.Any(column =>
+                string.Equals(column.Name, "SnapshotNumber", StringComparison.OrdinalIgnoreCase)
+                && column.PrimaryKeyPosition == 2))
+        {
+            throw new TaskPersistenceException(
+                "The TaskAttemptSnapshots table is missing its composite snapshot primary key.");
+        }
+
+        var transitionColumns = await ReadTableColumnsAsync(
+            connection,
+            transaction: null,
+            "StateTransitions",
+            cancellationToken);
+        RequireColumns(
+            "StateTransitions",
+            transitionColumns,
+            [
+                "TaskId", "TransitionId", "OperationId", "ExpectedRevision", "ResultingRevision",
+                "PreviousState", "NextState", "Timestamp", "Reason", "AttemptId",
+                "AttemptSnapshotNumber"
+            ]);
+        if (!transitionColumns.Any(column =>
+                string.Equals(column.Name, "TaskId", StringComparison.OrdinalIgnoreCase)
+                && column.PrimaryKeyPosition == 1)
+            || !transitionColumns.Any(column =>
+                string.Equals(column.Name, "TransitionId", StringComparison.OrdinalIgnoreCase)
+                && column.PrimaryKeyPosition == 2))
+        {
+            throw new TaskPersistenceException(
+                "The StateTransitions table is missing its task/transition primary key.");
+        }
+
+        var transitionIndexes = await ReadUniqueIndexesAsync(
+            connection,
+            transaction: null,
+            "StateTransitions",
+            cancellationToken);
+        if (!transitionIndexes.Any(index => index.Columns.SequenceEqual(
+                ["TaskId", "OperationId"],
+                StringComparer.OrdinalIgnoreCase))
+            || !transitionIndexes.Any(index => index.Columns.SequenceEqual(
+                ["TaskId", "ResultingRevision"],
+                StringComparer.OrdinalIgnoreCase)))
+        {
+            throw new TaskPersistenceException(
+                "The StateTransitions table is missing its operation or revision uniqueness constraint.");
+        }
+
+        await ValidateRequiredForeignKeyAsync(
+            connection,
+            "TaskAttempts",
+            "Tasks",
+            [("TaskId", "TaskId")],
+            cancellationToken);
+        await ValidateRequiredForeignKeyAsync(
+            connection,
+            "TaskAttemptSnapshots",
+            "TaskAttempts",
+            [("AttemptId", "AttemptId")],
+            cancellationToken);
+        await ValidateRequiredForeignKeyAsync(
+            connection,
+            "StateTransitions",
+            "TaskOperations",
+            [("TaskId", "TaskId"), ("OperationId", "OperationId")],
+            cancellationToken);
+        await ValidateRequiredForeignKeyAsync(
+            connection,
+            "StateTransitions",
+            "TaskAttemptSnapshots",
+            [("AttemptId", "AttemptId"), ("AttemptSnapshotNumber", "SnapshotNumber")],
+            cancellationToken);
+        await ValidateRequiredForeignKeyAsync(
+            connection,
+            "StateTransitions",
+            "TaskAttempts",
+            [("TaskId", "TaskId"), ("AttemptId", "AttemptId")],
+            cancellationToken);
+        await ValidateExecutionHistoryTriggersAsync(connection, cancellationToken);
     }
 
     private static async System.Threading.Tasks.Task<IReadOnlyList<TableColumn>> ReadTableColumnsAsync(
@@ -653,6 +990,89 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
 
         throw new TaskPersistenceException(
             "The TaskOperations table is missing its required restricted TaskId foreign key.");
+    }
+
+    private static async AsyncTask ValidateRequiredForeignKeyAsync(
+        SqliteConnection connection,
+        string tableName,
+        string referencedTable,
+        IReadOnlyList<(string FromColumn, string ReferencedColumn)> columns,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA foreign_key_list(\"{tableName}\");";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var mappings = new List<(int Id, int Sequence, string Table, string From, string To, string OnDelete)>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            mappings.Add((
+                reader.GetInt32(0),
+                reader.GetInt32(1),
+                reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(6)));
+        }
+
+        var isPresent = mappings
+            .GroupBy(mapping => mapping.Id)
+            .Any(group =>
+                group.Count() == columns.Count
+                && group.All(mapping =>
+                    string.Equals(mapping.Table, referencedTable, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(mapping.OnDelete, "RESTRICT", StringComparison.OrdinalIgnoreCase))
+                && group.OrderBy(mapping => mapping.Sequence)
+                    .Select(mapping => (mapping.From, mapping.To))
+                    .Zip(columns)
+                    .All(pair =>
+                        string.Equals(pair.First.From, pair.Second.FromColumn, StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(
+                            pair.First.To,
+                            pair.Second.ReferencedColumn,
+                            StringComparison.OrdinalIgnoreCase)));
+        if (!isPresent)
+        {
+            throw new TaskPersistenceException(
+                $"The {tableName} table is missing its restricted foreign key to {referencedTable}.");
+        }
+    }
+
+    private static async AsyncTask ValidateExecutionHistoryTriggersAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var requiredTriggers = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["TaskAttempts_NoUpdate"] = "BEFORE UPDATE ON TaskAttempts",
+            ["TaskAttempts_NoDelete"] = "BEFORE DELETE ON TaskAttempts",
+            ["TaskAttemptSnapshots_NoUpdate"] = "BEFORE UPDATE ON TaskAttemptSnapshots",
+            ["TaskAttemptSnapshots_NoDelete"] = "BEFORE DELETE ON TaskAttemptSnapshots",
+            ["StateTransitions_NoUpdate"] = "BEFORE UPDATE ON StateTransitions",
+            ["StateTransitions_NoDelete"] = "BEFORE DELETE ON StateTransitions"
+        };
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT name, sql
+            FROM sqlite_schema
+            WHERE type = 'trigger';
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var name = reader.GetString(0);
+            if (requiredTriggers.TryGetValue(name, out var requiredSql)
+                && reader.GetString(1).Contains(requiredSql, StringComparison.OrdinalIgnoreCase))
+            {
+                requiredTriggers.Remove(name);
+            }
+        }
+
+        if (requiredTriggers.Count != 0)
+        {
+            throw new TaskPersistenceException(
+                "One or more immutable attempt or state-transition history triggers are missing or invalid.");
+        }
     }
 
     private static async AsyncTask ValidateImmutableHistoryTriggersAsync(
@@ -813,11 +1233,124 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
                 Version = excluded.Version,
                 AppliedAt = excluded.AppliedAt;
 
+            PRAGMA user_version = {SchemaVersionTwo};
+            """;
+        command.Parameters.AddWithValue("$version", SchemaVersionTwo);
+        command.Parameters.AddWithValue("$appliedAt", FormatTimestamp(DateTimeOffset.UtcNow));
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async AsyncTask ApplySchemaVersionThreeAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = $"""
+            CREATE TABLE TaskAttempts (
+                AttemptId TEXT NOT NULL PRIMARY KEY CHECK (length(trim(AttemptId)) > 0),
+                TaskId TEXT NOT NULL,
+                Number INTEGER NOT NULL CHECK (Number > 0),
+                StartedAt TEXT NOT NULL,
+                UNIQUE (TaskId, Number),
+                UNIQUE (TaskId, AttemptId),
+                FOREIGN KEY (TaskId) REFERENCES Tasks (TaskId) ON DELETE RESTRICT
+            );
+
+            CREATE TABLE TaskAttemptSnapshots (
+                AttemptId TEXT NOT NULL,
+                SnapshotNumber INTEGER NOT NULL CHECK (SnapshotNumber > 0),
+                State INTEGER NOT NULL CHECK (State BETWEEN 0 AND {(int)TaskAttemptState.Unknown}),
+                CompletedAt TEXT NULL,
+                PRIMARY KEY (AttemptId, SnapshotNumber),
+                FOREIGN KEY (AttemptId) REFERENCES TaskAttempts (AttemptId) ON DELETE RESTRICT
+            );
+
+            CREATE TABLE StateTransitions (
+                TaskId TEXT NOT NULL,
+                TransitionId TEXT NOT NULL CHECK (length(trim(TransitionId)) > 0),
+                OperationId TEXT NOT NULL CHECK (length(trim(OperationId)) > 0),
+                ExpectedRevision INTEGER NOT NULL CHECK (ExpectedRevision >= 0),
+                ResultingRevision INTEGER NOT NULL CHECK (ResultingRevision > 0),
+                PreviousState INTEGER NOT NULL CHECK (PreviousState BETWEEN 0 AND {MaximumTaskStateValue}),
+                NextState INTEGER NOT NULL CHECK (NextState BETWEEN 0 AND {MaximumTaskStateValue}),
+                Timestamp TEXT NOT NULL,
+                Reason TEXT NOT NULL CHECK (length(trim(Reason)) > 0),
+                AttemptId TEXT NULL,
+                AttemptSnapshotNumber INTEGER NULL,
+                PRIMARY KEY (TaskId, TransitionId),
+                UNIQUE (TaskId, OperationId),
+                UNIQUE (TaskId, ResultingRevision),
+                FOREIGN KEY (TaskId, OperationId)
+                    REFERENCES TaskOperations (TaskId, OperationId) ON DELETE RESTRICT,
+                FOREIGN KEY (AttemptId, AttemptSnapshotNumber)
+                    REFERENCES TaskAttemptSnapshots (AttemptId, SnapshotNumber) ON DELETE RESTRICT,
+                FOREIGN KEY (TaskId, AttemptId)
+                    REFERENCES TaskAttempts (TaskId, AttemptId) ON DELETE RESTRICT,
+                CHECK (ResultingRevision = ExpectedRevision + 1),
+                CHECK ((AttemptId IS NULL) = (AttemptSnapshotNumber IS NULL)),
+                CHECK (PreviousState <> NextState)
+            );
+
+            CREATE TRIGGER TaskAttempts_NoUpdate
+            BEFORE UPDATE ON TaskAttempts
+            BEGIN
+                SELECT RAISE(ABORT, 'Task attempt identity is immutable.');
+            END;
+
+            CREATE TRIGGER TaskAttempts_NoDelete
+            BEFORE DELETE ON TaskAttempts
+            BEGIN
+                SELECT RAISE(ABORT, 'Task attempt identity is immutable.');
+            END;
+
+            CREATE TRIGGER TaskAttemptSnapshots_NoUpdate
+            BEFORE UPDATE ON TaskAttemptSnapshots
+            BEGIN
+                SELECT RAISE(ABORT, 'Task attempt history is immutable.');
+            END;
+
+            CREATE TRIGGER TaskAttemptSnapshots_NoDelete
+            BEFORE DELETE ON TaskAttemptSnapshots
+            BEGIN
+                SELECT RAISE(ABORT, 'Task attempt history is immutable.');
+            END;
+
+            CREATE TRIGGER StateTransitions_NoUpdate
+            BEFORE UPDATE ON StateTransitions
+            BEGIN
+                SELECT RAISE(ABORT, 'Task state-transition history is immutable.');
+            END;
+
+            CREATE TRIGGER StateTransitions_NoDelete
+            BEFORE DELETE ON StateTransitions
+            BEGIN
+                SELECT RAISE(ABORT, 'Task state-transition history is immutable.');
+            END;
+
+            UPDATE {SchemaVersionTable}
+            SET Version = $version, AppliedAt = $appliedAt
+            WHERE Id = 1 AND Version = $previousVersion;
+
             PRAGMA user_version = {SchemaVersion};
             """;
         command.Parameters.AddWithValue("$version", SchemaVersion);
+        command.Parameters.AddWithValue("$previousVersion", SchemaVersionTwo);
         command.Parameters.AddWithValue("$appliedAt", FormatTimestamp(DateTimeOffset.UtcNow));
         await command.ExecuteNonQueryAsync(cancellationToken);
+
+        await using var verifyCommand = connection.CreateCommand();
+        verifyCommand.Transaction = transaction;
+        verifyCommand.CommandText = $"SELECT Version FROM {SchemaVersionTable} WHERE Id = 1;";
+        var version = Convert.ToInt32(
+            await verifyCommand.ExecuteScalarAsync(cancellationToken),
+            CultureInfo.InvariantCulture);
+        if (version != SchemaVersion)
+        {
+            throw new TaskPersistenceException(
+                "The schema-version metadata was not at version 2 when the attempt-history migration ran.");
+        }
     }
 
     private static async AsyncTask SetLegacySchemaVersionAsync(
@@ -1183,6 +1716,445 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
     private static string FormatTimestamp(DateTimeOffset timestamp) =>
         timestamp.ToString("O", CultureInfo.InvariantCulture);
 
+    private static async System.Threading.Tasks.Task<int> AppendAttemptSnapshotAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        TaskAttempt attempt,
+        CancellationToken cancellationToken)
+    {
+        await using (var taskCommand = connection.CreateCommand())
+        {
+            taskCommand.Transaction = transaction;
+            taskCommand.CommandText = "SELECT 1 FROM Tasks WHERE TaskId = $taskId;";
+            taskCommand.Parameters.AddWithValue("$taskId", attempt.TaskId.Value);
+            if (await taskCommand.ExecuteScalarAsync(cancellationToken) is null)
+            {
+                throw new TaskNotFoundException(attempt.TaskId.Value);
+            }
+        }
+
+        var history = await LoadAttemptSnapshotsForIdAsync(
+            connection,
+            transaction,
+            attempt.Id,
+            cancellationToken);
+        if (history.Count != 0)
+        {
+            var latest = history[^1];
+            if (latest.Attempt.TaskId != attempt.TaskId
+                || latest.Attempt.Number != attempt.Number
+                || latest.Attempt.StartedAt != attempt.StartedAt)
+            {
+                throw new TaskPersistenceException(
+                    $"Attempt identifier '{attempt.Id.Value}' was reused with different identity data.");
+            }
+
+            var duplicate = history.FirstOrDefault(snapshot => snapshot.Attempt == attempt);
+            if (duplicate is not null)
+            {
+                return duplicate.SnapshotNumber;
+            }
+
+            var expectedNext = latest.Attempt.TransitionTo(attempt.State, attempt.CompletedAt);
+            if (expectedNext != attempt)
+            {
+                throw new InvalidOperationException(
+                    $"Attempt '{attempt.Id.Value}' is not a valid next state snapshot.");
+            }
+        }
+        else
+        {
+            await using (var numberCommand = connection.CreateCommand())
+            {
+                numberCommand.Transaction = transaction;
+                numberCommand.CommandText = """
+                    SELECT COALESCE(MAX(Number), 0)
+                    FROM TaskAttempts
+                    WHERE TaskId = $taskId;
+                    """;
+                numberCommand.Parameters.AddWithValue("$taskId", attempt.TaskId.Value);
+                var lastNumber = Convert.ToInt32(
+                    await numberCommand.ExecuteScalarAsync(cancellationToken),
+                    CultureInfo.InvariantCulture);
+                if (attempt.Number != checked(lastNumber + 1))
+                {
+                    throw new InvalidOperationException(
+                        $"Task '{attempt.TaskId.Value}' must append attempt number {lastNumber + 1} next.");
+                }
+            }
+
+            await using var insertIdentity = connection.CreateCommand();
+            insertIdentity.Transaction = transaction;
+            insertIdentity.CommandText = """
+                INSERT INTO TaskAttempts (AttemptId, TaskId, Number, StartedAt)
+                VALUES ($attemptId, $taskId, $number, $startedAt);
+                """;
+            insertIdentity.Parameters.AddWithValue("$attemptId", attempt.Id.Value);
+            insertIdentity.Parameters.AddWithValue("$taskId", attempt.TaskId.Value);
+            insertIdentity.Parameters.AddWithValue("$number", attempt.Number);
+            insertIdentity.Parameters.AddWithValue("$startedAt", FormatTimestamp(attempt.StartedAt));
+            await insertIdentity.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        var snapshotNumber = history.Count == 0
+            ? 1
+            : checked(history[^1].SnapshotNumber + 1);
+        await InsertAttemptSnapshotAsync(
+            connection,
+            transaction,
+            attempt,
+            snapshotNumber,
+            cancellationToken);
+        return snapshotNumber;
+    }
+
+    private static async System.Threading.Tasks.Task InsertAttemptSnapshotAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        TaskAttempt attempt,
+        int snapshotNumber,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO TaskAttemptSnapshots (AttemptId, SnapshotNumber, State, CompletedAt)
+            VALUES ($attemptId, $snapshotNumber, $state, $completedAt);
+            """;
+        command.Parameters.AddWithValue("$attemptId", attempt.Id.Value);
+        command.Parameters.AddWithValue("$snapshotNumber", snapshotNumber);
+        command.Parameters.AddWithValue("$state", (int)attempt.State);
+        command.Parameters.AddWithValue(
+            "$completedAt",
+            (object?)(attempt.CompletedAt.HasValue
+                ? FormatTimestamp(attempt.CompletedAt.Value)
+                : null) ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async System.Threading.Tasks.Task<IReadOnlyList<AttemptSnapshotRow>>
+        LoadAttemptSnapshotsForIdAsync(
+            SqliteConnection connection,
+            SqliteTransaction transaction,
+            AttemptId attemptId,
+            CancellationToken cancellationToken)
+    {
+        var snapshots = new List<AttemptSnapshotRow>();
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT a.TaskId, a.Number, a.StartedAt,
+                   s.SnapshotNumber, s.State, s.CompletedAt
+            FROM TaskAttempts AS a
+            INNER JOIN TaskAttemptSnapshots AS s ON s.AttemptId = a.AttemptId
+            WHERE a.AttemptId = $attemptId
+            ORDER BY s.SnapshotNumber;
+            """;
+        command.Parameters.AddWithValue("$attemptId", attemptId.Value);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            try
+            {
+                var taskId = new TaskId(reader.GetString(0));
+                var number = reader.GetInt32(1);
+                var startedAt = ParseTimestamp(reader.GetString(2), "StartedAt");
+                var snapshotNumber = reader.GetInt32(3);
+                var stateValue = reader.GetInt32(4);
+                if (!Enum.IsDefined(typeof(TaskAttemptState), stateValue))
+                {
+                    throw new InvalidDataException("The stored attempt state is undefined.");
+                }
+
+                var completedAt = reader.IsDBNull(5)
+                    ? (DateTimeOffset?)null
+                    : ParseTimestamp(reader.GetString(5), "CompletedAt");
+                var attempt = new TaskAttempt(
+                    attemptId,
+                    taskId,
+                    number,
+                    (TaskAttemptState)stateValue,
+                    startedAt,
+                    completedAt);
+                if (snapshotNumber != snapshots.Count + 1)
+                {
+                    throw new InvalidDataException("Attempt snapshot numbers are not contiguous.");
+                }
+
+                if (snapshots.Count > 0)
+                {
+                    var expectedNext = snapshots[^1].Attempt.TransitionTo(attempt.State, attempt.CompletedAt);
+                    if (expectedNext != attempt)
+                    {
+                        throw new InvalidDataException("Attempt snapshots do not follow the domain transition rules.");
+                    }
+                }
+
+                snapshots.Add(new AttemptSnapshotRow(snapshotNumber, attempt));
+            }
+            catch (TaskDataCorruptionException)
+            {
+                throw;
+            }
+            catch (Exception exception) when (
+                exception is ArgumentException
+                or FormatException
+                or InvalidCastException
+                or InvalidDataException
+                or InvalidOperationException
+                or OverflowException)
+            {
+                throw new TaskDataCorruptionException(
+                    $"Attempt '{attemptId.Value}' contains an invalid persisted snapshot.",
+                    exception);
+            }
+        }
+
+        if (snapshots.Count == 0)
+        {
+            await using var identityCommand = connection.CreateCommand();
+            identityCommand.Transaction = transaction;
+            identityCommand.CommandText = "SELECT 1 FROM TaskAttempts WHERE AttemptId = $attemptId;";
+            identityCommand.Parameters.AddWithValue("$attemptId", attemptId.Value);
+            if (await identityCommand.ExecuteScalarAsync(cancellationToken) is not null)
+            {
+                throw new TaskDataCorruptionException(
+                    $"Attempt '{attemptId.Value}' has an identity record without any state snapshots.",
+                    new InvalidDataException("Every attempt identity must have a first snapshot."));
+            }
+        }
+
+        return snapshots;
+    }
+
+    private static async System.Threading.Tasks.Task<IReadOnlyList<TaskAttempt>> LoadAttemptSnapshotsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        TaskId taskId,
+        CancellationToken cancellationToken)
+    {
+        var attemptIds = new List<(AttemptId Id, int Number)>();
+        await using (var command = connection.CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT AttemptId, Number
+                FROM TaskAttempts
+                WHERE TaskId = $taskId
+                ORDER BY Number;
+                """;
+            command.Parameters.AddWithValue("$taskId", taskId.Value);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                try
+                {
+                    var attemptNumber = reader.GetInt32(1);
+                    if (attemptNumber != attemptIds.Count + 1)
+                    {
+                        throw new InvalidDataException(
+                            "Persisted task attempt numbers are not contiguous.");
+                    }
+
+                    attemptIds.Add((new AttemptId(reader.GetString(0)), attemptNumber));
+                }
+                catch (Exception exception) when (
+                    exception is ArgumentException
+                    or InvalidCastException
+                    or InvalidDataException
+                    or OverflowException)
+                {
+                    throw new TaskDataCorruptionException(
+                        $"Task '{taskId.Value}' contains an invalid attempt identifier.",
+                        exception);
+                }
+            }
+        }
+
+        var attempts = new List<TaskAttempt>();
+        foreach (var (attemptId, _) in attemptIds)
+        {
+            var snapshots = await LoadAttemptSnapshotsForIdAsync(
+                connection,
+                transaction,
+                attemptId,
+                cancellationToken);
+            if (snapshots.Count == 0 || snapshots.Any(snapshot => snapshot.Attempt.TaskId != taskId))
+            {
+                throw new TaskDataCorruptionException(
+                    $"Attempt '{attemptId.Value}' has incomplete or inconsistent persisted history.",
+                    new InvalidDataException("Attempt identity and history do not match."));
+            }
+
+            attempts.AddRange(snapshots.Select(snapshot => snapshot.Attempt));
+        }
+
+        return attempts;
+    }
+
+    private static async System.Threading.Tasks.Task<int?> FindAttemptSnapshotAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        TaskAttempt attempt,
+        CancellationToken cancellationToken)
+    {
+        var snapshots = await LoadAttemptSnapshotsForIdAsync(
+            connection,
+            transaction,
+            attempt.Id,
+            cancellationToken);
+        return snapshots.FirstOrDefault(snapshot => snapshot.Attempt == attempt)?.SnapshotNumber;
+    }
+
+    private static async AsyncTask InsertStateTransitionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        TaskTransitionOperation operation,
+        StateTransition transition,
+        TaskRevision resultingRevision,
+        TaskAttempt? attempt,
+        int? attemptSnapshotNumber,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO StateTransitions (
+                TaskId, TransitionId, OperationId, ExpectedRevision, ResultingRevision,
+                PreviousState, NextState, Timestamp, Reason, AttemptId, AttemptSnapshotNumber)
+            VALUES (
+                $taskId, $transitionId, $operationId, $expectedRevision, $resultingRevision,
+                $previousState, $nextState, $timestamp, $reason, $attemptId, $attemptSnapshotNumber);
+            """;
+        command.Parameters.AddWithValue("$taskId", transition.TaskId.Value);
+        command.Parameters.AddWithValue("$transitionId", transition.Id.Value);
+        command.Parameters.AddWithValue("$operationId", operation.OperationId.Value);
+        command.Parameters.AddWithValue("$expectedRevision", operation.ExpectedRevision.Value);
+        command.Parameters.AddWithValue("$resultingRevision", resultingRevision.Value);
+        command.Parameters.AddWithValue("$previousState", (int)transition.PreviousState);
+        command.Parameters.AddWithValue("$nextState", (int)transition.NextState);
+        command.Parameters.AddWithValue("$timestamp", FormatTimestamp(transition.Timestamp));
+        command.Parameters.AddWithValue("$reason", transition.Reason);
+        command.Parameters.AddWithValue("$attemptId", (object?)attempt?.Id.Value ?? DBNull.Value);
+        command.Parameters.AddWithValue(
+            "$attemptSnapshotNumber",
+            (object?)attemptSnapshotNumber ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async System.Threading.Tasks.Task<TaskStateTransitionRecord?>
+        LoadStateTransitionForOperationAsync(
+            SqliteConnection connection,
+            SqliteTransaction transaction,
+            TaskId taskId,
+            OperationId operationId,
+            CancellationToken cancellationToken)
+    {
+        var transitions = await LoadStateTransitionsAsync(connection, transaction, taskId, cancellationToken);
+        return transitions.FirstOrDefault(record => record.OperationId == operationId);
+    }
+
+    private static async System.Threading.Tasks.Task<IReadOnlyList<TaskStateTransitionRecord>>
+        LoadStateTransitionsAsync(
+            SqliteConnection connection,
+            SqliteTransaction transaction,
+            TaskId taskId,
+            CancellationToken cancellationToken)
+    {
+        var transitions = new List<TaskStateTransitionRecord>();
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT s.TransitionId, s.OperationId, s.ExpectedRevision, s.ResultingRevision,
+                   s.PreviousState, s.NextState, s.Timestamp, s.Reason,
+                   s.AttemptId, s.AttemptSnapshotNumber,
+                   o.ExpectedRevision, o.PreviousState, o.TargetState,
+                   o.ResultingRevision, o.ResultingState, o.AppliedAt
+            FROM StateTransitions AS s
+            INNER JOIN TaskOperations AS o
+                ON o.TaskId = s.TaskId AND o.OperationId = s.OperationId
+            WHERE s.TaskId = $taskId
+            ORDER BY s.ResultingRevision;
+            """;
+        command.Parameters.AddWithValue("$taskId", taskId.Value);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            try
+            {
+                var operationId = new OperationId(reader.GetString(1));
+                var expectedRevision = new TaskRevision(reader.GetInt32(2));
+                var resultingRevision = new TaskRevision(reader.GetInt32(3));
+                var previousState = ReadState(reader.GetInt32(4), "PreviousState");
+                var nextState = ReadState(reader.GetInt32(5), "NextState");
+                var timestamp = ParseTimestamp(reader.GetString(6), "Timestamp");
+                var transition = new StateTransition(
+                    new TransitionId(reader.GetString(0)),
+                    taskId,
+                    previousState,
+                    nextState,
+                    timestamp,
+                    reader.GetString(7));
+
+                var associatedAttemptId = reader.IsDBNull(8)
+                    ? null
+                    : new AttemptId(reader.GetString(8));
+                var associatedAttemptSnapshotNumber = reader.IsDBNull(9)
+                    ? (int?)null
+                    : reader.GetInt32(9);
+                if ((associatedAttemptId is null) != (associatedAttemptSnapshotNumber is null))
+                {
+                    throw new InvalidDataException(
+                        "The state transition contains an incomplete attempt snapshot reference.");
+                }
+
+                var operationExpectedRevision = new TaskRevision(reader.GetInt32(10));
+                var operationPreviousState = ReadState(reader.GetInt32(11), "OperationPreviousState");
+                var operationTargetState = ReadState(reader.GetInt32(12), "OperationTargetState");
+                var operationResultingRevision = new TaskRevision(reader.GetInt32(13));
+                var operationResultingState = ReadState(reader.GetInt32(14), "OperationResultingState");
+                var operationAppliedAt = ParseTimestamp(reader.GetString(15), "AppliedAt");
+                if (resultingRevision.Value != expectedRevision.Value + 1
+                    || expectedRevision != operationExpectedRevision
+                    || resultingRevision != operationResultingRevision
+                    || previousState != operationPreviousState
+                    || nextState != operationTargetState
+                    || nextState != operationResultingState
+                    || timestamp != operationAppliedAt)
+                {
+                    throw new InvalidDataException(
+                        "The persisted state transition does not match its task operation.");
+                }
+
+                transitions.Add(new TaskStateTransitionRecord(
+                    transition,
+                    operationId,
+                    expectedRevision,
+                    resultingRevision,
+                    associatedAttemptId,
+                    associatedAttemptSnapshotNumber));
+            }
+            catch (TaskDataCorruptionException)
+            {
+                throw;
+            }
+            catch (Exception exception) when (
+                exception is ArgumentException
+                or FormatException
+                or InvalidCastException
+                or InvalidDataException
+                or InvalidOperationException
+                or OverflowException)
+            {
+                throw new TaskDataCorruptionException(
+                    $"Task '{taskId.Value}' contains an invalid state-transition record.",
+                    exception);
+            }
+        }
+
+        return transitions;
+    }
+
     private static async AsyncTask UpdateTaskAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -1269,6 +2241,8 @@ public sealed class SqliteTaskRepository : ITaskRepository, IDisposable, IAsyncD
         TaskRevision ResultingRevision,
         TaskState ResultingState,
         DateTimeOffset AppliedAt);
+
+    private sealed record AttemptSnapshotRow(int SnapshotNumber, TaskAttempt Attempt);
 
     private sealed record AcceptanceCriterionData(string Id, string Description, bool IsMandatory);
 

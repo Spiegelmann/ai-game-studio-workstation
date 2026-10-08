@@ -1,3 +1,4 @@
+using AiGameStudioWorkstation.Core.Domain.Execution;
 using AiGameStudioWorkstation.Core.Domain.Tasks;
 using DomainTask = AiGameStudioWorkstation.Core.Domain.Tasks.Task;
 
@@ -14,5 +15,23 @@ public interface ITaskRepository
     System.Threading.Tasks.Task<TaskOperationResult> ApplyTransitionAsync(
         TaskTransitionOperation operation,
         DateTimeOffset updatedAt,
+        CancellationToken cancellationToken = default);
+
+    System.Threading.Tasks.Task<TaskOperationResult> ApplyTransitionWithHistoryAsync(
+        TaskTransitionOperation operation,
+        StateTransition transition,
+        TaskAttempt? attempt = null,
+        CancellationToken cancellationToken = default);
+
+    System.Threading.Tasks.Task AppendAttemptAsync(
+        TaskAttempt attempt,
+        CancellationToken cancellationToken = default);
+
+    System.Threading.Tasks.Task<IReadOnlyList<TaskAttempt>> GetAttemptsAsync(
+        TaskId taskId,
+        CancellationToken cancellationToken = default);
+
+    System.Threading.Tasks.Task<IReadOnlyList<TaskStateTransitionRecord>> GetStateTransitionsAsync(
+        TaskId taskId,
         CancellationToken cancellationToken = default);
 }
