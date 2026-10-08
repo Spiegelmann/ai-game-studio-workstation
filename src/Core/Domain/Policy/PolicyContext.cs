@@ -85,6 +85,8 @@ public sealed record PolicyContext
             .ThenBy(rule => rule.Decision.Outcome)
             .ThenBy(rule => rule.Decision.Reason.Code, StringComparer.Ordinal)
             .ThenBy(rule => rule.Decision.Reason.Explanation, StringComparer.Ordinal)
+            .ThenBy(rule => rule.Action.Scope.Kind)
+            .ThenBy(rule => rule.Action.Scope.BoundaryId?.Value, StringComparer.Ordinal)
             .ToArray());
     }
 

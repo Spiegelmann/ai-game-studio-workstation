@@ -188,7 +188,92 @@ public sealed class PolicyEvaluationTraceTests
         Assert.Equal(first.Outcome, second.Outcome);
         Assert.Equal(first.Reason, second.Reason);
         Assert.Equal(first.Trace, second.Trace);
+        Assert.Equal(first.Trace!.GetHashCode(), second.Trace!.GetHashCode());
         Assert.Equal(first, second);
+    }
+
+    [Fact]
+    public void Equivalent_registration_and_rule_sets_have_order_independent_traces()
+    {
+        var scopeA = PolicyScope.Bounded(new PolicyScopeId("workspace-A"));
+        var scopeB = PolicyScope.Bounded(new PolicyScopeId("workspace-B"));
+        var registrationA = TrustedRegistration("workspace.read", scopeA);
+        var registrationB = TrustedRegistration("workspace.read", scopeB);
+        var reason = new PolicyReason("policy.explicit-denial", "The action is prohibited.");
+        var ruleA = new PolicyRule(new PolicyAction("read", scopeA), PolicyDecision.Deny(reason));
+        var ruleB = new PolicyRule(new PolicyAction("read", scopeB), PolicyDecision.Deny(reason));
+        var evaluator = new PolicyEvaluator();
+        var action = ScopedAction("read", scopeB);
+
+        var first = evaluator.Evaluate(
+            action,
+            PolicyContext.FromRegistrations(
+                PolicyContextStatus.Complete,
+                [registrationB, registrationA],
+                [ruleB, ruleA]));
+        var second = evaluator.Evaluate(
+            action,
+            PolicyContext.FromRegistrations(
+                PolicyContextStatus.Complete,
+                [registrationA, registrationB],
+                [ruleA, ruleB]));
+        var trace = Assert.IsType<PolicyEvaluationTrace>(first.Trace);
+
+        Assert.Equal(first, second);
+        Assert.Equal(trace, second.Trace);
+        Assert.Equal(
+            ["workspace-A", "workspace-B"],
+            trace.Capability.Registrations.Select(candidate => candidate.Registration.Scope.BoundaryId!.Value));
+        Assert.Equal(
+            ["workspace-A", "workspace-B"],
+            trace.Rules.Select(rule => rule.Rule.Action.Scope.BoundaryId!.Value));
+        Assert.Equal(PolicyEvaluationDecisionSource.Rule, trace.DecisionSource);
+        Assert.Equal(0, trace.WinningRuleOrder);
+    }
+
+    [Fact]
+    public void Directly_constructed_decisions_remain_untraced_and_value_equal()
+    {
+        var reason = new PolicyReason("policy.direct", "Constructed outside the evaluator.");
+        var first = PolicyDecision.Allow(reason);
+        var second = PolicyDecision.Allow(new PolicyReason("policy.direct", "Constructed outside the evaluator."));
+
+        Assert.Null(first.Trace);
+        Assert.Equal(first, second);
+    }
+
+    [Fact]
+    public void Preserves_input_order_for_rules_tied_on_policy_fields_but_differing_in_embedded_traces()
+    {
+        var evaluator = new PolicyEvaluator();
+        var scopeA = PolicyScope.Bounded(new PolicyScopeId("workspace-A"));
+        var scopeB = PolicyScope.Bounded(new PolicyScopeId("workspace-B"));
+        var context = PolicyContext.FromRegistrations(
+            PolicyContextStatus.Complete,
+            [TrustedRegistration("workspace.read", PolicyScope.Global)]);
+        var decisionA = evaluator.Evaluate(ScopedAction("read", scopeA), context);
+        var decisionB = evaluator.Evaluate(ScopedAction("read", scopeB), context);
+        var ruleA = new PolicyRule(new PolicyAction("read"), decisionA);
+        var ruleB = new PolicyRule(new PolicyAction("read"), decisionB);
+
+        var forward = evaluator.Evaluate(
+            ScopedAction("read", PolicyScope.Global),
+            PolicyContext.FromRegistrations(PolicyContextStatus.Complete, context.Registrations, [ruleA, ruleB]));
+        var reversed = evaluator.Evaluate(
+            ScopedAction("read", PolicyScope.Global),
+            PolicyContext.FromRegistrations(PolicyContextStatus.Complete, context.Registrations, [ruleB, ruleA]));
+        var forwardTrace = Assert.IsType<PolicyEvaluationTrace>(forward.Trace);
+        var reversedTrace = Assert.IsType<PolicyEvaluationTrace>(reversed.Trace);
+
+        Assert.Equal(
+            ["workspace-A", "workspace-B"],
+            forwardTrace.Rules.Select(rule => rule.Rule.Decision.Trace!.Action.Scope.BoundaryId!.Value));
+        Assert.Equal(
+            ["workspace-B", "workspace-A"],
+            reversedTrace.Rules.Select(rule => rule.Rule.Decision.Trace!.Action.Scope.BoundaryId!.Value));
+        Assert.Equal(forward.Outcome, reversed.Outcome);
+        Assert.Equal(forward.Reason, reversed.Reason);
+        Assert.NotEqual(forwardTrace, reversedTrace);
     }
 
     [Fact]
