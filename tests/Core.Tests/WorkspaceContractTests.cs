@@ -29,6 +29,10 @@ public sealed class WorkspaceContractTests
     [InlineData("src//file.txt")]
     [InlineData("src\\")]
     [InlineData("src/file\n.txt")]
+    [InlineData("src/file:stream")]
+    [InlineData("src/CON.txt")]
+    [InlineData("src/trailing.")]
+    [InlineData("src/trailing ")]
     public void Workspace_resource_identifiers_reject_incomplete_or_non_relative_values(string value)
     {
         Assert.Throws<ArgumentException>(() => new WorkspaceResourceId(value));
@@ -40,6 +44,15 @@ public sealed class WorkspaceContractTests
         var resourceId = new WorkspaceResourceId("src/Core/Domain/Task.cs");
 
         Assert.Equal("src/Core/Domain/Task.cs", resourceId.Value);
+    }
+
+    [Fact]
+    public void Workspace_resource_identifier_normalizes_separator_variations_without_changing_identity()
+    {
+        var resourceId = new WorkspaceResourceId(@"src\Core/Domain\Task.cs");
+
+        Assert.Equal(@"src\Core/Domain\Task.cs", resourceId.Value);
+        Assert.Equal("src/Core/Domain/Task.cs", resourceId.NormalizedValue);
     }
 
     [Fact]
